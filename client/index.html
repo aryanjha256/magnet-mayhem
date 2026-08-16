@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Magnet Mayhem — Phase 1 Sandbox</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --panel: rgba(14, 18, 28, 0.82);
+        --border: rgba(120, 150, 200, 0.18);
+        --text: #c8d6ea;
+        --dim: #7286a0;
+        --attract: #4fa8ff;
+        --repel: #ff5a4f;
+      }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; margin: 0; overflow: hidden; background: #0a0c12; }
+      body {
+        font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        color: var(--text);
+      }
+      #viewport { display: block; width: 100vw; height: 100vh; touch-action: none; }
+
+      .panel {
+        position: fixed;
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 10px 12px;
+        backdrop-filter: blur(8px);
+      }
+
+      #hud { top: 12px; left: 12px; white-space: pre; letter-spacing: 0.02em; }
+
+      #legend { bottom: 12px; left: 12px; color: var(--dim); }
+      #legend b { color: var(--text); font-weight: 600; }
+      #legend .attract { color: var(--attract); }
+      #legend .repel { color: var(--repel); }
+      #legend div { margin-top: 2px; }
+      #legend div:first-child { margin-top: 0; }
+
+      #tuner {
+        top: 12px;
+        right: 12px;
+        width: 290px;
+        max-height: calc(100vh - 24px);
+        overflow-y: auto;
+      }
+      .tuner-group { margin-bottom: 12px; }
+      .tuner-group:last-of-type { margin-bottom: 8px; }
+      .tuner-group h3 {
+        margin: 0 0 6px;
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        color: var(--dim);
+      }
+      .tuner-row {
+        display: grid;
+        grid-template-columns: 108px 1fr 42px;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 4px;
+      }
+      .tuner-row select { grid-column: 2 / span 2; }
+      .tuner-name { color: var(--dim); }
+      .tuner-value { text-align: right; font-variant-numeric: tabular-nums; }
+      .tuner-row input[type='range'] { width: 100%; accent-color: var(--attract); }
+      .tuner-row select {
+        background: rgba(0, 0, 0, 0.4);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        padding: 2px 4px;
+        font: inherit;
+      }
+      .tuner-reset {
+        width: 100%;
+        padding: 5px;
+        background: rgba(0, 0, 0, 0.35);
+        color: var(--dim);
+        border: 1px solid var(--border);
+        border-radius: 5px;
+        font: inherit;
+        cursor: pointer;
+      }
+      .tuner-reset:hover { color: var(--text); }
+
+      #loading {
+        position: fixed;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        color: var(--dim);
+        letter-spacing: 0.2em;
+        text-transform: uppercase;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="viewport"></canvas>
+
+    <div id="hud" class="panel"></div>
+
+    <div id="legend" class="panel">
+      <div><b>WASD</b> move &nbsp; <b>Space</b> dash &nbsp; <b>R</b> reset</div>
+      <div>
+        <b>Hold RMB</b> <span class="attract">attract</span> &nbsp;
+        <b>Hold LMB</b> <span class="repel">repel</span>
+      </div>
+      <div>
+        <b>Q</b> / <b>E</b> toggle the same two on and off &nbsp;
+        <b>Esc</b> release
+        <span style="opacity: 0.6">(touchpad: keys latch, so both hands stay free to aim)</span>
+      </div>
+      <div>
+        <b>Gamepad</b> left stick move &nbsp; right stick aim &nbsp;
+        <b>LT</b> <span class="attract">attract</span> / <b>RT</b> <span class="repel">repel</span> (analog) &nbsp;
+        <b>A</b> dash &nbsp; <b>Start</b> reset
+      </div>
+      <div>Aim with the mouse. Force is equal and opposite — light things fly, heavy things fling <i>you</i>.</div>
+    </div>
+
+    <div id="tuner" class="panel"></div>
+
+    <div id="loading">loading physics…</div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

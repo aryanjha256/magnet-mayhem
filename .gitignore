@@ -1,0 +1,15 @@
+# Dependencies — hoisted to the root by npm workspaces, but a stale
+# client/node_modules can still appear if a sub-package is installed directly.
+node_modules/
+
+# Build output
+dist/
+.vite/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor / OS
+.DS_Store
+*.swp

@@ -1,0 +1,19 @@
+{
+  "name": "@magnet/shared",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    "./sim/*": "./src/sim/*.ts",
+    "./net/*": "./src/net/*.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@dimforge/rapier3d-compat": "^0.20.0"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2"
+  }
+}
