@@ -18,6 +18,7 @@ import {
   type Entity,
   type EntityId,
   type MagnetLink,
+  type Quat,
   type Vec3,
 } from './types';
 
@@ -57,6 +58,12 @@ export interface WorldOptions {
    * sandbox, which is what the isolated physics measurements need.
    */
   match: boolean;
+  /**
+   * Owns the outcome of a fall. A predicting client sets this false: the server
+   * decides who respawns and who is eliminated, and a client quietly respawning
+   * its own player fights that every time it happens.
+   */
+  authoritative: boolean;
 }
 
 /** One colour per spawn slot, so players and bots are told apart at a glance. */
@@ -76,7 +83,7 @@ const PLAYER_SPAWNS: readonly Vec3[] = [
   { x: 1.5, y: 2, z: 3.5 },
 ];
 
-const DEFAULT_OPTIONS: WorldOptions = { players: 1, bots: 2, match: true };
+const DEFAULT_OPTIONS: WorldOptions = { players: 1, bots: 2, match: true, authoritative: true };
 
 /** Per-player state that used to be fields on the world itself. */
 export interface PlayerState {
@@ -128,6 +135,7 @@ export class SimWorld {
   };
 
   private readonly matchEnabled: boolean;
+  private readonly authoritative: boolean;
   private platformCollider: RAPIER.Collider | null = null;
 
   private readonly physics: RAPIER.World;
@@ -147,6 +155,7 @@ export class SimWorld {
     }
     this.rng = new Rng(seed);
     this.matchEnabled = opts.match;
+    this.authoritative = opts.authoritative;
     this.physics = new RAPIER.World({ x: 0, y: TUNABLES.gravity, z: 0 });
     this.physics.timestep = TICK_DT;
 
@@ -240,6 +249,64 @@ export class SimWorld {
     this.bodies.delete(id);
     removeWhere(this.entities, (e) => e.id === id);
     removeWhere(this.dynamics, (d) => d.entity.id === id);
+  }
+
+  /**
+   * Overwrite a body from an authoritative source — i.e. a server snapshot.
+   *
+   * A predicting client simulates everything but only *owns* its own player;
+   * every other body is stamped back to what the server said before the next
+   * step, so local physics never drifts away from the room.
+   */
+  setBodyState(id: EntityId, pos: Vec3, rot: Quat, linvel?: Vec3): void {
+    const body = this.bodies.get(id);
+    const entity = this.entities.find((e) => e.id === id);
+    if (!body || !entity) return;
+
+    body.setTranslation(pos, false);
+    body.setRotation(rot, false);
+    // Velocity matters as much as position: a body teleported each tick with
+    // zero velocity collides like a wall instead of like something moving.
+    body.setLinvel(linvel ?? { x: 0, y: 0, z: 0 }, false);
+    body.setAngvel({ x: 0, y: 0, z: 0 }, false);
+
+    entity.pos.x = pos.x;
+    entity.pos.y = pos.y;
+    entity.pos.z = pos.z;
+    entity.rot.x = rot.x;
+    entity.rot.y = rot.y;
+    entity.rot.z = rot.z;
+    entity.rot.w = rot.w;
+    entity.prevPos.x = pos.x;
+    entity.prevPos.y = pos.y;
+    entity.prevPos.z = pos.z;
+    entity.prevRot.x = rot.x;
+    entity.prevRot.y = rot.y;
+    entity.prevRot.z = rot.z;
+    entity.prevRot.w = rot.w;
+  }
+
+  /** Nudge the local player toward where the server says it should be. */
+  nudgeBody(id: EntityId, dx: number, dy: number, dz: number): void {
+    const body = this.bodies.get(id);
+    if (!body) return;
+    const p = body.translation();
+    body.setTranslation({ x: p.x + dx, y: p.y + dy, z: p.z + dz }, false);
+  }
+
+  /**
+   * Mirror the server's arena size. Without this a predicting client walks on a
+   * full-size disc while the server has already closed it in, and every step
+   * near the rim mispredicts.
+   */
+  setArenaRadius(radius: number): void {
+    this.match.arenaRadius = radius;
+    this.applyArenaRadius(radius);
+  }
+
+  /** Enable or disable a body, mirroring server-side elimination. */
+  setBodyEnabled(id: EntityId, enabled: boolean): void {
+    this.bodies.get(id)?.setEnabled(enabled);
   }
 
   /**
@@ -427,10 +494,8 @@ export class SimWorld {
 
     for (const { entity, body } of this.dynamics) {
       const player = this.players.get(entity.id);
-      if (player) {
-        player.alive = true;
-        body.setEnabled(true);
-      }
+      if (player) player.alive = true;
+      body.setEnabled(true);
       this.respawn(entity, body);
     }
     m.startedWith = this.players.size;
@@ -533,24 +598,27 @@ export class SimWorld {
   }
 
   private respawnFallen(): void {
+    // A mirror never decides a fall; the snapshot will tell it what happened.
+    if (!this.authoritative) return;
     const eliminating = this.matchEnabled && this.match.phase === 'playing';
 
     for (const { entity, body } of this.dynamics) {
+      // Already out. Its body is parked below the arena, so without this the
+      // death counter would tick up every frame for the rest of the round.
+      if (!body.isEnabled()) continue;
       if (entity.pos.y > TUNABLES.killY) continue;
 
       const fallen = this.players.get(entity.id);
-      // Already out: its body is parked below the arena, so without this the
-      // death counter would tick up every frame for the rest of the round.
-      if (fallen && !fallen.alive) continue;
-      if (fallen) {
-        fallen.deaths++;
-        if (eliminating) {
-          // Out for the rest of the round. Disabling the body is what makes a
-          // shove matter: there is no five-second reprieve any more.
-          fallen.alive = false;
-          body.setEnabled(false);
-          continue;
-        }
+      if (fallen) fallen.deaths++;
+
+      if (eliminating) {
+        // Out for the rest of the round — objects as well as players. Objects
+        // used to respawn, but every spawn point sits near the original 9m rim,
+        // so once the arena closed past them they fell, respawned over the
+        // void, and fell again, littering the sky with debris.
+        if (fallen) fallen.alive = false;
+        body.setEnabled(false);
+        continue;
       }
       this.respawn(entity, body);
     }
@@ -567,11 +635,10 @@ export class SimWorld {
     // Deterministic jitter so re-dropped balls do not stack into a tower.
     const jitterX = isPlayer ? 0 : this.rng.range(-1.2, 1.2);
     const jitterZ = isPlayer ? 0 : this.rng.range(-1.2, 1.2);
-    const target = {
-      x: origin.x + jitterX,
-      y: origin.y + 2,
-      z: origin.z + jitterZ,
-    };
+    // Pull the spawn inside the current disc. Every object's spawn sits near
+    // the original 9m rim, so once the arena closes past them they would fall,
+    // respawn over the void, and fall again — forever.
+    const target = this.insideArena(origin.x + jitterX, origin.y + 2, origin.z + jitterZ);
 
     body.setTranslation(target, true);
     body.setRotation(quatIdentity(), true);
@@ -584,6 +651,15 @@ export class SimWorld {
     // Snap history too, or the renderer lerps across the whole teleport.
     entity.prevPos = { ...target };
     entity.prevRot = quatIdentity();
+  }
+
+  /** Scale a spawn point back inside the arena, keeping a little margin. */
+  private insideArena(x: number, y: number, z: number): Vec3 {
+    const limit = this.match.arenaRadius * 0.75;
+    const radius = Math.hypot(x, z);
+    if (radius <= limit || radius < 1e-4) return { x, y, z };
+    const scale = limit / radius;
+    return { x: x * scale, y, z: z * scale };
   }
 
   /** The spawn slot with the largest distance to the nearest other player. */

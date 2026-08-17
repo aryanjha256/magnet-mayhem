@@ -370,6 +370,213 @@ async function main(): Promise<void> {
       `human falls=${idle.deaths}, engaged=${engaged}`);
   }
 
+  section('Camera frames the arena');
+  {
+    const { cameraDistanceFor, arenaCameraDistance } = await import('../src/render/framing');
+    const FOV = 48;
+    const WIDE = 16 / 9;
+
+    // The whole disc has to be on screen: this is a brawler where an opponent
+    // winding up a shove from off-screen is missing information, which is why
+    // the camera no longer chases anybody.
+    const full = cameraDistanceFor(PLATFORM_RADIUS, FOV, WIDE, 1.18);
+    const halfV = (FOV * Math.PI) / 360;
+    const visibleRadius = full * Math.tan(halfV);
+    check('a full arena fits with margin to spare', visibleRadius > PLATFORM_RADIUS,
+      `sees ${visibleRadius.toFixed(1)}m of a ${PLATFORM_RADIUS}m disc`);
+
+    // Scale must never change mid-round. Tracking the live radius grew players
+    // and objects on screen as the arena closed, which reads as a zoom and
+    // breaks the constant screen-to-world mapping that mouse aiming relies on.
+    // `arenaCameraDistance` takes no radius at all — that is the enforcement.
+    check('play distance is framed to the full arena, not the current one',
+      Math.abs(arenaCameraDistance(FOV, WIDE, 1.18) - full) < 1e-9,
+      `${arenaCameraDistance(FOV, WIDE, 1.18).toFixed(1)}`);
+    check('a closed arena still fits inside that frame',
+      cameraDistanceFor(3, FOV, WIDE, 1.18) < full);
+
+    // A tall window is constrained horizontally, not vertically — get this
+    // backwards and the arena is cropped on somebody else's monitor.
+    const tall = cameraDistanceFor(PLATFORM_RADIUS, FOV, 0.6, 1.18);
+    check('a tall window pulls back further', tall > full,
+      `${tall.toFixed(1)} vs ${full.toFixed(1)}`);
+    check('framing scales with the margin slider',
+      cameraDistanceFor(PLATFORM_RADIUS, FOV, WIDE, 2) >
+        cameraDistanceFor(PLATFORM_RADIUS, FOV, WIDE, 1));
+  }
+
+  section('Client prediction');
+  {
+    const { Predictor } = await import('../src/net/Predictor');
+
+    // Reconciliation compares against the *same tick*, never the raw position.
+    // Steering toward a snapshot that is 100ms old would drag the player into
+    // the past and fight every input.
+    const p = new Predictor();
+    for (let t = 1; t <= 20; t++) p.record(t, { x: t * 0.1, y: 0.55, z: 0 });
+
+    p.reconcile(10, { x: 1.3, y: 0.55, z: 0 }, { x: 2, y: 0.55, z: 0 });
+    check('error is measured against the matching tick',
+      Math.abs(p.error - 0.3) < 1e-6, `${p.error.toFixed(3)}m`);
+
+    // A prediction that was right must not be "corrected" into jitter.
+    const clean = new Predictor();
+    clean.record(5, { x: 2, y: 0.55, z: 0 });
+    clean.reconcile(5, { x: 2, y: 0.55, z: 0 }, { x: 2, y: 0.55, z: 0 });
+    check('an exact prediction queues no correction', clean.corrections === 0);
+
+    // The server repeats ticks in overlapping snapshots; each must apply once.
+    const once = new Predictor();
+    once.record(7, { x: 0, y: 0, z: 0 });
+    once.reconcile(7, { x: 1, y: 0, z: 0 }, { x: 0, y: 0, z: 0 });
+    once.reconcile(7, { x: 1, y: 0, z: 0 }, { x: 0, y: 0, z: 0 });
+    once.reconcile(6, { x: 1, y: 0, z: 0 }, { x: 0, y: 0, z: 0 });
+    check('a tick is reconciled exactly once', once.corrections === 1,
+      `${once.corrections} corrections`);
+
+    // Clocks drift over a long session. Doing nothing here is how a client ends
+    // up permanently lost in the void, so an unmatched tick still recovers when
+    // the disagreement is large.
+    const drifted = new Predictor();
+    drifted.record(1, { x: 0, y: 0, z: 0 });
+    drifted.reconcile(400, { x: 9, y: 0, z: 0 }, { x: 0, y: 0, z: 0 });
+    check('an unmatched tick still recovers from a big error',
+      drifted.recoveries === 1 && drifted.corrections === 0);
+
+    const nearby = new Predictor();
+    nearby.record(1, { x: 0, y: 0, z: 0 });
+    nearby.reconcile(400, { x: 0.2, y: 0, z: 0 }, { x: 0, y: 0, z: 0 });
+    check('but a small unmatched difference is left alone', nearby.recoveries === 0);
+
+    // Applying the correction to a live world.
+    const world = new SimWorld(SEED, { players: 1, bots: 0, match: false });
+    run(world, TICK_RATE);
+    const id = world.playerId;
+    const startX = world.player.pos.x;
+
+    const gentle = new Predictor();
+    gentle.record(world.tick, world.player.pos);
+    gentle.reconcile(world.tick, { ...world.player.pos, x: startX + 1 }, world.player.pos);
+    gentle.apply(world, id);
+    run(world, 1);
+    const afterOne = world.player.pos.x - startX;
+    check('a small error is eased in, not snapped', afterOne > 0.01 && afterOne < 0.5,
+      `moved ${afterOne.toFixed(3)}m of 1.00m`);
+
+    for (let i = 0; i < 60; i++) {
+      gentle.apply(world, id);
+      run(world, 1);
+    }
+    check('and converges', Math.abs(world.player.pos.x - (startX + 1)) < 0.2,
+      `x=${(world.player.pos.x - startX).toFixed(2)} of 1.00`);
+
+    // A huge error is a respawn or a stall — sliding across the arena in full
+    // view is worse than a jump.
+    const jumpy = new Predictor();
+    jumpy.record(world.tick, world.player.pos);
+    jumpy.reconcile(world.tick, { ...world.player.pos, x: world.player.pos.x + 20 }, world.player.pos);
+    jumpy.apply(world, id);
+    check('a hopeless error teleports instead', jumpy.snaps === 1);
+  }
+
+  section('Object prediction (stage 2)');
+  {
+    const { ObjectPredictor } = await import('../src/net/ObjectPredictor');
+    const world = new SimWorld(SEED, { players: 2, bots: 0, match: false });
+    run(world, TICK_RATE);
+    const [me, them] = [...world.players.values()];
+    const ball = lightBall(world);
+
+    const objects = new ObjectPredictor();
+    check('it is on by default', objects.enabled);
+
+    // Claims come from the sim's own link list, so ownership can never
+    // disagree with what the physics actually did.
+    world.links.length = 0;
+    world.links.push({ sourceId: me!.id, targetId: ball.id, force: -100 });
+    objects.update(world, me!.id);
+    check('a magnetised body is claimed', objects.weightFor(ball.id) === 1);
+    check('and counted as held', objects.owned === 1);
+
+    // Another player is driven by input we cannot see, so predicting them
+    // would diverge immediately.
+    world.links.length = 0;
+    world.links.push({ sourceId: me!.id, targetId: them!.id, force: -100 });
+    objects.update(world, me!.id);
+    check('another player is never owned', objects.weightFor(them!.id) === 0);
+
+    // Somebody else's magnet is their business.
+    world.links.length = 0;
+    world.links.push({ sourceId: them!.id, targetId: ball.id, force: -100 });
+    objects.update(world, me!.id);
+    check("someone else's grab is not our claim", objects.weightFor(ball.id) < 1);
+
+    // Release must fade, not snap: a ball teleporting the instant you let go
+    // is more jarring than the lag this feature removes.
+    const fade = new ObjectPredictor();
+    withTunables({ objectBlendTicks: 10 }, () => {
+      world.links.length = 0;
+      world.links.push({ sourceId: me!.id, targetId: ball.id, force: -100 });
+      fade.update(world, me!.id);
+
+      world.links.length = 0;
+      fade.update(world, me!.id);
+      const first = fade.weightFor(ball.id);
+      check('releasing starts a fade, not a snap', first > 0 && first < 1,
+        `weight ${first.toFixed(2)}`);
+
+      for (let i = 0; i < 12; i++) fade.update(world, me!.id);
+      check('and it reaches the server version', fade.weightFor(ball.id) === 0);
+    });
+
+    // Divergence: if the server has it somewhere else, we were wrong.
+    const stubborn = new ObjectPredictor();
+    world.links.length = 0;
+    world.links.push({ sourceId: me!.id, targetId: ball.id, force: -100 });
+    stubborn.update(world, me!.id);
+    stubborn.abandon(ball.id);
+    check('a diverged body is handed back', stubborn.weightFor(ball.id) === 0);
+    check('and the give-up is counted', stubborn.abandons === 1);
+
+    withTunables({ predictObjects: 0 }, () => {
+      const off = new ObjectPredictor();
+      world.links.length = 0;
+      world.links.push({ sourceId: me!.id, targetId: ball.id, force: -100 });
+      off.update(world, me!.id);
+      check('the toggle really disables it', !off.enabled && off.weightFor(ball.id) === 0);
+    });
+  }
+
+  section('Authoritative state overwrite');
+  {
+    const world = new SimWorld(SEED, { players: 2, bots: 0, match: false });
+    run(world, TICK_RATE);
+    const [, b] = [...world.players.values()];
+
+    world.setBodyState(b!.id, { x: 4, y: 3, z: -2 }, { x: 0, y: 0, z: 0, w: 1 },
+      { x: 5, y: 0, z: 0 });
+    check('a body can be stamped from a snapshot',
+      Math.abs(b!.entity.pos.x - 4) < 1e-6 && Math.abs(b!.entity.pos.z + 2) < 1e-6,
+      `(${b!.entity.pos.x.toFixed(2)}, ${b!.entity.pos.z.toFixed(2)})`);
+
+    // Velocity has to come with it: a body teleported each tick at rest
+    // collides like a wall rather than like something moving.
+    run(world, 2);
+    check('and carries its velocity into the next step', b!.entity.pos.x > 4,
+      `x=${b!.entity.pos.x.toFixed(2)}`);
+
+    // The client mirrors the server's shrinking disc, or it walks on floor
+    // that is not there.
+    world.setArenaRadius(4);
+    check('arena radius can be mirrored', world.arenaRadius === 4);
+
+    world.setBodyEnabled(b!.id, false);
+    const parked = { ...b!.entity.pos };
+    run(world, 20);
+    check('a disabled body stops simulating',
+      Math.abs(b!.entity.pos.y - parked.y) < 1e-6, `y=${b!.entity.pos.y.toFixed(2)}`);
+  }
+
   section('Rounds, elimination and the shrinking arena');
   {
     const world = new SimWorld(SEED, { players: 3, bots: 0 });
@@ -444,6 +651,54 @@ async function main(): Promise<void> {
         'a ball resting at r=6.7 fell into the void');
       check('and it strands players, which is the point', anyoneStranded);
     });
+  }
+
+  section('Nothing is left littering the void');
+  {
+    // Every object spawns near the original 9m rim. Once the arena closes past
+    // them they fall — and if they respawn, they respawn over open space and
+    // fall again, forever. That is what filled the sky with debris.
+    const world = new SimWorld(SEED, { players: 2, bots: 0 });
+    const step = (n: number): void => {
+      for (let i = 0; i < n; i++) world.step(new Map<EntityId, Input>());
+    };
+
+    withTunables(
+      { shrinkGraceSeconds: 1, shrinkSeconds: 5, arenaMinRadius: 4, roundSeconds: 600 },
+      () => {
+        const objects = world.entities.filter((e) => e.kind === 'ball' || e.kind === 'crate');
+        check('every object spawns outside a closed arena',
+          objects.every((e) => Math.hypot(e.spawn.x, e.spawn.z) > 4));
+
+        step(TICK_RATE * 12);
+
+        let respawns = 0;
+        for (let i = 0; i < TICK_RATE * 10; i++) {
+          const before = objects.map((e) => e.pos.y);
+          step(1);
+          objects.forEach((e, k) => {
+            if (e.pos.y > before[k]! + 1) respawns++;
+          });
+        }
+        check('a fallen object stays fallen for the round', respawns === 0,
+          `${respawns} respawn events in 10s`);
+
+        const airborne = objects.filter(
+          (e) => e.pos.y < -1 && e.pos.y > TUNABLES.killY,
+        );
+        check('and nothing hangs in the void', airborne.length === 0,
+          `${airborne.length} objects mid-air`);
+      },
+    );
+
+    // The next round has to give the toys back.
+    while (world.match.phase !== 'countdown') step(1);
+    step(1);
+    const restored = world.entities.filter(
+      (e) => (e.kind === 'ball' || e.kind === 'crate') && e.pos.y > -1,
+    );
+    check('the next round restores every object', restored.length === 11,
+      `${restored.length}/11 back`);
   }
 
   section('Winning a match');

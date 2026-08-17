@@ -25,7 +25,7 @@ tell the two modes apart.
 
 | | |
 |---|---|
-| `WASD` | move (camera-relative, camera never rotates) |
+| `WASD` | move (world-aligned; the camera never moves or rotates) |
 | `Mouse` | aim — the magnet is a cone, not a sphere |
 | `Hold RMB` | attract (momentary) |
 | `Hold LMB` | repel (momentary) |
@@ -133,6 +133,30 @@ None of these cost anything now; all of them are painful to retrofit.
 Deliberately *not* built yet: any network abstraction, serialization, or
 client/server split. Those get guessed wrong when there's no server to test
 against.
+
+## The camera is static
+
+It frames the whole disc and never follows anyone. In a brawler this size, an
+opponent winding up a shove from off-screen is missing information you need —
+and being flung sent a follow-cam lurching after you at exactly the moment you
+most needed a stable read of the arena.
+
+A fixed view also makes screen position map to world position consistently,
+which is what makes mouse aiming predictable, and it means `WASD` is world-
+aligned rather than relative to a camera that was drifting.
+
+It is framed to the arena's **starting** size and never changes with the shrink.
+Tracking the live radius seemed obviously right and was clearly wrong in play:
+players and objects grew on screen as the round went on, which reads as the
+camera zooming rather than the floor closing in, and it destroys the constant
+screen-to-world mapping that makes aiming stable. Holding the frame still lets
+the shrink show as what it actually is — the void eating the arena from the
+edges.
+
+`arenaCameraDistance` takes no radius argument, which is what stops that
+regression coming back. Tilt and framing are live under **Camera** in the tuner;
+the fit maths lives in [src/render/framing.ts](src/render/framing.ts) so it can
+be checked headlessly.
 
 ## Rounds
 

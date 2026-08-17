@@ -5,11 +5,25 @@ import { TUNABLES } from '@magnet/shared/sim/tunables';
 import type { Entity, EntityId, Vec3 } from '@magnet/shared/sim/types';
 import type { SimWorld } from '@magnet/shared/sim/World';
 
+import { arenaCameraDistance } from './framing';
+
 const ATTRACT_COLOR = new THREE.Color(0x4fa8ff);
 const REPEL_COLOR = new THREE.Color(0xff5a4f);
 
-/** Camera offset from the player. Fixed orientation, so WASD never rotates. */
-const CAMERA_OFFSET = new THREE.Vector3(0, 26, 23);
+/**
+ * The camera is static and frames the whole arena.
+ *
+ * It used to chase the player, which is wrong for a game this size: you cannot
+ * see the opponent winding up a shove from off-screen, and being flung sends
+ * the camera lurching after you exactly when you most need a stable read of the
+ * disc. A fixed, pulled-back view keeps every player, every object and both
+ * edges visible at once, and makes screen position map to world position
+ * consistently — which is also what makes mouse aiming feel predictable.
+ *
+ * It does tighten as the arena closes, so the action never recedes into the
+ * distance during the endgame.
+ */
+const CAMERA_LOOK_AT = new THREE.Vector3(0, 0, 0);
 
 /**
  * Reads the sim and draws it. Owns no game state — every number it renders
@@ -35,8 +49,8 @@ export class Renderer {
   private readonly ndc = new THREE.Vector2();
   private readonly hit = new THREE.Vector3();
 
-  private readonly camAnchor = new THREE.Vector3();
-  private readonly tmpPos = new THREE.Vector3();
+  /** Smoothed viewing distance, eased so the shrink does not pop the frame. */
+  private cameraDistance = 0;
   private readonly qa = new THREE.Quaternion();
   private readonly qb = new THREE.Quaternion();
 
@@ -53,7 +67,6 @@ export class Renderer {
     this.scene.fog = new THREE.Fog(0x0a0c12, 60, 130);
 
     this.camera = new THREE.PerspectiveCamera(48, 1, 0.1, 400);
-    this.camera.position.copy(CAMERA_OFFSET);
 
     this.buildLights();
     this.buildVoid();
@@ -126,11 +139,10 @@ export class Renderer {
     this.updateElimination(world);
     this.updateTethers(world);
 
+    this.updateCamera(dt);
+
     const viewMesh = this.meshes.get(viewId);
-    if (viewMesh) {
-      this.updateWedge(world, viewId, viewMesh.position);
-      this.updateCamera(viewMesh.position, dt);
-    }
+    if (viewMesh) this.updateWedge(world, viewId, viewMesh.position);
 
     this.renderer.render(this.scene, this.camera);
   }
@@ -162,20 +174,18 @@ export class Renderer {
     mesh.scale.set(scale, 1, scale);
   }
 
-  /** Eliminated players stay on screen as ghosts rather than vanishing. */
+  /**
+   * Hide anything the sim has taken out of play. Eliminated players and fallen
+   * objects are parked below the kill plane, and drawing them leaves a field of
+   * debris hanging in the void.
+   */
   private updateElimination(world: SimWorld): void {
-    for (const state of world.players.values()) {
-      const mesh = this.meshes.get(state.id);
+    for (const entity of world.entities) {
+      if (entity.static) continue;
+      const mesh = this.meshes.get(entity.id);
       if (!mesh) continue;
-      const material = mesh.material as THREE.MeshStandardMaterial;
-      if (state.alive) {
-        mesh.visible = true;
-        material.opacity = 1;
-        material.transparent = false;
-      } else {
-        // Parked far below by the sim; hide rather than draw a body in the void.
-        mesh.visible = false;
-      }
+      const player = world.players.get(entity.id);
+      mesh.visible = player ? player.alive : entity.pos.y > TUNABLES.killY;
     }
   }
 
@@ -252,13 +262,29 @@ export class Renderer {
     this.wedgeMaterial.opacity = 0.05 + 0.13 * Math.abs(view.magnetAxis);
   }
 
-  private updateCamera(target: THREE.Vector3, dt: number): void {
-    // Frame-rate independent exponential smoothing.
-    const k = 1 - Math.exp(-8 * dt);
-    this.tmpPos.set(target.x, 0, target.z);
-    this.camAnchor.lerp(this.tmpPos, k);
-    this.camera.position.copy(this.camAnchor).add(CAMERA_OFFSET);
-    this.camera.lookAt(this.camAnchor);
+  private updateCamera(dt: number): void {
+    // Framed to the arena's full size, never the current one: constant scale
+    // beats a tight frame. Only a resize or the margin slider moves this.
+    const target = arenaCameraDistance(
+      this.camera.fov,
+      this.camera.aspect,
+      TUNABLES.cameraMargin,
+    );
+
+    // Eased only so dragging the margin slider or resizing the window does not
+    // snap the view; in play this value is constant.
+    this.cameraDistance =
+      this.cameraDistance === 0
+        ? target
+        : this.cameraDistance + (target - this.cameraDistance) * (1 - Math.exp(-4 * dt));
+
+    const tilt = (TUNABLES.cameraTiltDeg * Math.PI) / 180;
+    this.camera.position.set(
+      0,
+      Math.sin(tilt) * this.cameraDistance,
+      Math.cos(tilt) * this.cameraDistance,
+    );
+    this.camera.lookAt(CAMERA_LOOK_AT);
   }
 
   private buildLights(): void {

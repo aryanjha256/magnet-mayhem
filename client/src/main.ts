@@ -4,15 +4,31 @@ import { buildInput } from './input/buildInput';
 import { GamepadSource } from './input/GamepadSource';
 import { InputSource } from './input/InputSource';
 import { Connection } from './net/Connection';
+import { ObjectPredictor } from './net/ObjectPredictor';
+import { Predictor } from './net/Predictor';
 import { SnapshotBuffer } from './net/SnapshotBuffer';
 import { Renderer } from './render/Renderer';
 import { BotDirector } from '@magnet/shared/sim/Bot';
 import type { Input } from '@magnet/shared/sim/input';
+import { BODY_STRIDE } from '@magnet/shared/net/protocol';
 import type { EntityId } from '@magnet/shared/sim/types';
 import { initSim, SimWorld, TICK_DT } from '@magnet/shared/sim/World';
 
 /** Never simulate more than this many ticks in one frame; drop the rest. */
 const MAX_CATCHUP_STEPS = 5;
+
+/** The local player's authoritative position out of a snapshot, if present. */
+function readPlayerPos(
+  snapshot: { b: number[] },
+  id: EntityId,
+): { x: number; y: number; z: number } | null {
+  for (let i = 0; i < snapshot.b.length; i += BODY_STRIDE) {
+    if (snapshot.b[i] === id) {
+      return { x: snapshot.b[i + 1]!, y: snapshot.b[i + 2]!, z: snapshot.b[i + 3]! };
+    }
+  }
+  return null;
+}
 
 function requireEl<T extends HTMLElement>(selector: string): T {
   const el = document.querySelector<T>(selector);
@@ -38,8 +54,11 @@ async function main(): Promise<void> {
   // Online, the client runs no physics at all: the world is a *view*, its
   // transforms overwritten by snapshots. Same class either way, so the renderer
   // and HUD cannot tell the difference.
+  // `match: false` online: the server owns rounds, the countdown and the
+  // shrink. A client running its own would freeze input during a countdown the
+  // server is not having, and fight it over the arena radius.
   let world = online
-    ? new SimWorld(0x5eed, { players: 0, bots: 0 })
+    ? new SimWorld(0x5eed, { players: 0, bots: 0, match: false, authoritative: false })
     : new SimWorld();
 
   const canvas = requireEl<HTMLCanvasElement>('#viewport');
@@ -57,6 +76,8 @@ async function main(): Promise<void> {
   requireEl('#loading').remove();
 
   const snapshots = new SnapshotBuffer();
+  const predictor = new Predictor();
+  const objects = new ObjectPredictor();
   let viewId: EntityId = online ? 0 : world.playerId;
   let connection: Connection | null = null;
 
@@ -67,6 +88,11 @@ async function main(): Promise<void> {
           if (!world.players.has(id)) world.addPlayer(id);
         }
         viewId = message.you;
+        // Align the local tick counter with the server's, or reconciliation
+        // has no shared clock to compare predictions against.
+        world.tick = message.tick;
+        predictor.reset();
+        objects.reset();
         renderer.syncEntities(world);
       },
       onJoin: (id) => {
@@ -74,7 +100,19 @@ async function main(): Promise<void> {
         renderer.syncEntities(world);
       },
       onLeave: (id) => world.removePlayer(id),
-      onSnapshot: (message) => snapshots.push(message),
+      onSnapshot: (message) => {
+        snapshots.push(message);
+        // Compare the server's word for its tick against what we predicted at
+        // that same tick — never against the raw position, which is ~100ms old
+        // and would drag the player backwards.
+        const local = world.players.get(viewId);
+        const authoritative = readPlayerPos(message, viewId);
+        // Only while alive: a dead player is not predicted at all, so there is
+        // nothing to reconcile and the snapshot stamps it directly.
+        if (authoritative && local?.alive) {
+          predictor.reconcile(message.tick, authoritative, local.entity.pos);
+        }
+      },
     });
   }
 
@@ -83,6 +121,7 @@ async function main(): Promise<void> {
   let previous = performance.now();
   let pendingDash = false;
   let pendingReset = false;
+  let wasPredicting = false;
   const tickInputs = new Map<EntityId, Input>();
   const bots = new BotDirector();
 
@@ -125,7 +164,7 @@ async function main(): Promise<void> {
       pendingReset = false;
 
       const command = buildInput(
-        world.tick,
+        world.tick + 1,
         input.raw,
         gamepad.state.connected ? gamepad.state : null,
         pendingDash,
@@ -134,13 +173,75 @@ async function main(): Promise<void> {
         lastAim,
       );
       connection.send(command);
-      pendingDash = false;
 
-      snapshots.apply(world, dt, connection.tickRate);
+      // Simulate locally so input lands the instant it is pressed. Only our own
+      // player is trusted from this: every other body gets stamped back to the
+      // server's version immediately after.
+      const me = world.players.get(viewId);
+      // Prediction is only for a player who is actually in the round. While
+      // eliminated the client must hand its body back to the server entirely:
+      // it is parked below the arena, and a client still steering it just flies
+      // around the void with the camera following.
+      const predicting = me?.alive === true;
+      if (predicting !== wasPredicting) {
+        // Crossing this boundary invalidates every recorded sample — the body
+        // is about to teleport, either into the void or back onto the disc.
+        predictor.reset();
+        objects.reset();
+        wasPredicting = predicting;
+      }
+
+      let steps = 0;
+      while (accumulator >= TICK_DT && steps < MAX_CATCHUP_STEPS) {
+        tickInputs.clear();
+        if (predicting) tickInputs.set(viewId, { ...command, tick: world.tick + 1 });
+
+        // Replay remote magnets from their last reported state. Their movement
+        // does not matter — we stamp their positions anyway — but their pull on
+        // shared objects very much does: without it, any ball two people are
+        // fighting over diverges instantly and gets handed straight back.
+        if (objects.enabled) {
+          for (const other of world.players.values()) {
+            if (other.id === viewId || !other.alive || other.magnetAxis === 0) continue;
+            tickInputs.set(other.id, {
+              tick: world.tick + 1,
+              moveX: 0,
+              moveZ: 0,
+              aimX: other.aimX,
+              aimZ: other.aimZ,
+              magnet: other.magnetAxis,
+              dash: false,
+            });
+          }
+        }
+
+        world.step(tickInputs);
+        objects.update(world, viewId);
+        if (predicting && me) {
+          predictor.apply(world, viewId);
+          predictor.record(world.tick, me.entity.pos);
+        }
+        accumulator -= TICK_DT;
+        steps++;
+      }
+      if (steps === MAX_CATCHUP_STEPS) accumulator = 0;
+      if (steps > 0) pendingDash = false;
+
+      // After stepping, so remote bodies show the smooth interpolated result
+      // rather than a discarded local physics guess.
+      // Skip the local player only while predicting it. Dead, it gets stamped
+      // like any other body, which is the thing that puts you back on the disc.
+      snapshots.apply(world, dt, connection.tickRate, predicting ? viewId : 0, objects);
       renderer.syncEntities(world);
-      hud.update(world, viewId, gamepad.state, dt);
-      // Snapshots arrive pre-interpolated, so there is no residual tick
-      // fraction for the renderer to blend across.
+      hud.update(world, viewId, gamepad.state, dt, {
+        error: predictor.error,
+        snaps: predictor.snaps,
+        recoveries: predictor.recoveries,
+        lagTicks: snapshots.delayTicks,
+        owned: objects.owned,
+        fading: objects.fading,
+        abandons: objects.abandons,
+      });
       renderer.render(world, viewId, 1, dt);
       return;
     }

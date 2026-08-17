@@ -12,7 +12,21 @@ export class Hud {
 
   constructor(private readonly el: HTMLElement) {}
 
-  update(world: SimWorld, viewId: EntityId, pad: GamepadState, dt: number): void {
+  update(
+    world: SimWorld,
+    viewId: EntityId,
+    pad: GamepadState,
+    dt: number,
+    net?: {
+      error: number;
+      snaps: number;
+      recoveries: number;
+      lagTicks: number;
+      owned: number;
+      fading: number;
+      abandons: number;
+    },
+  ): void {
     this.frames++;
     this.elapsed += dt;
     if (this.elapsed >= 0.25) {
@@ -60,6 +74,19 @@ export class Hud {
       `players ${world.players.size}`,
       `magnet ${magnet}`,
     ];
+
+    if (net) {
+      // Prediction error is the honest measure of whether the netcode is
+      // working: sustained metres means the client and server disagree.
+      lines.push(
+        '',
+        `net    ${(net.lagTicks / TICK_RATE * 1000).toFixed(0)}ms behind`,
+        `  err  ${net.error.toFixed(2)}m${net.snaps > 0 ? `  snaps ${net.snaps}` : ''}` +
+          `${net.recoveries > 0 ? `  recov ${net.recoveries}` : ''}`,
+        `  held ${net.owned}${net.fading > 0 ? ` +${net.fading} fading` : ''}` +
+          `${net.abandons > 0 ? `  gaveup ${net.abandons}` : ''}`,
+      );
+    }
 
     if (pad.connected) {
       // Live pad readout: two different controllers can map differently, and

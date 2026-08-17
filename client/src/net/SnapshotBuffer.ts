@@ -1,5 +1,6 @@
 import { BODY_STRIDE, PLAYER_STRIDE, type SnapshotMessage } from '@magnet/shared/net/protocol';
 import { MATCH_PHASES } from '@magnet/shared/sim/Match';
+import { TUNABLES } from '@magnet/shared/sim/tunables';
 import type { SimWorld } from '@magnet/shared/sim/World';
 
 /**
@@ -65,7 +66,13 @@ export class SnapshotBuffer {
    * Advance the render clock and write interpolated transforms into `world`.
    * The world is never stepped — the server owns the physics.
    */
-  apply(world: SimWorld, dt: number, tickRate: number): void {
+  apply(
+    world: SimWorld,
+    dt: number,
+    tickRate: number,
+    skipId = 0,
+    ownership?: Ownership,
+  ): void {
     const newest = this.latest;
     if (!newest || this.snapshots.length < 2) return;
 
@@ -102,11 +109,22 @@ export class SnapshotBuffer {
 
     const span = b.tick - a.tick;
     const alpha = span > 0 ? (this.renderTick - a.tick) / span : 0;
-    applyBodies(world, a, b, alpha);
+    applyBodies(world, a, b, alpha, skipId, tickRate, ownership);
     applyPlayers(world, newest);
     applyMatch(world, newest);
-    applyLinks(world, newest);
+    // With object prediction on, the local sim already produced links for every
+    // magnet in the room and they are a frame fresh rather than 100ms stale.
+    if (!ownership?.enabled) applyLinks(world, newest);
   }
+}
+
+const ROT = { x: 0, y: 0, z: 0, w: 1 };
+
+/** Lets the caller keep local control of bodies it is predicting. */
+export interface Ownership {
+  readonly enabled: boolean;
+  weightFor(id: number): number;
+  abandon(id: number): void;
 }
 
 function applyBodies(
@@ -114,12 +132,21 @@ function applyBodies(
   a: SnapshotMessage,
   b: SnapshotMessage,
   alpha: number,
+  skipId: number,
+  tickRate: number,
+  ownership?: Ownership,
 ): void {
   const next = new Map<number, number>();
   for (let i = 0; i < b.b.length; i += BODY_STRIDE) next.set(b.b[i]!, i);
 
+  const span = Math.max(1, b.tick - a.tick) / tickRate;
+
   for (let i = 0; i < a.b.length; i += BODY_STRIDE) {
     const id = a.b[i]!;
+    // The predicted player owns itself; stamping the server's stale position
+    // over it every frame is exactly what prediction exists to avoid.
+    if (id === skipId) continue;
+
     const entity = world.entities.find((e) => e.id === id);
     if (!entity) continue;
 
@@ -131,21 +158,45 @@ function applyBodies(
     const x = lerp(a.b[i + 1]!, src[k + 1]!, t);
     const y = lerp(a.b[i + 2]!, src[k + 2]!, t);
     const z = lerp(a.b[i + 3]!, src[k + 3]!, t);
+    nlerpInto(ROT, a.b, i + 4, src, k + 4, t);
 
-    // Already interpolated, so collapse the render-side history onto it —
-    // otherwise the renderer would interpolate an interpolation.
-    entity.pos.x = x;
-    entity.pos.y = y;
-    entity.pos.z = z;
-    entity.prevPos.x = x;
-    entity.prevPos.y = y;
-    entity.prevPos.z = z;
+    // Velocity is derived from the snapshot pair rather than sent on the wire.
+    // The predicted player collides with these bodies, and one teleported each
+    // tick with zero velocity behaves like a wall instead of like a moving ball.
+    const vx = j === undefined ? 0 : (b.b[k + 1]! - a.b[i + 1]!) / span;
+    const vy = j === undefined ? 0 : (b.b[k + 2]! - a.b[i + 2]!) / span;
+    const vz = j === undefined ? 0 : (b.b[k + 3]! - a.b[i + 3]!) / span;
 
-    nlerpInto(entity.rot, a.b, i + 4, src, k + 4, t);
-    entity.prevRot.x = entity.rot.x;
-    entity.prevRot.y = entity.rot.y;
-    entity.prevRot.z = entity.rot.z;
-    entity.prevRot.w = entity.rot.w;
+    const weight = ownership?.weightFor(id) ?? 0;
+    if (weight > 0) {
+      // How far the local guess has drifted from the server's version.
+      const drift = Math.hypot(entity.pos.x - x, entity.pos.y - y, entity.pos.z - z);
+      if (drift > TUNABLES.objectDivergenceLimit) {
+        // Someone else is pulling this too, or it hit something we did not
+        // simulate. Hand it straight back rather than fighting over it.
+        ownership?.abandon(id);
+      } else if (weight >= 1) {
+        // Fully ours: leave the local physics result alone entirely.
+        continue;
+      } else {
+        // Fading home. Blending the position rather than snapping is what
+        // stops a released ball teleporting the moment you let go.
+        const t = 1 - weight;
+        world.setBodyState(
+          id,
+          {
+            x: entity.pos.x + (x - entity.pos.x) * t,
+            y: entity.pos.y + (y - entity.pos.y) * t,
+            z: entity.pos.z + (z - entity.pos.z) * t,
+          },
+          ROT,
+          { x: vx, y: vy, z: vz },
+        );
+        continue;
+      }
+    }
+
+    world.setBodyState(id, { x, y, z }, ROT, { x: vx, y: vy, z: vz });
   }
 }
 
@@ -158,7 +209,9 @@ function applyPlayers(world: SimWorld, snap: SnapshotMessage): void {
     state.aimZ = snap.p[i + 3]!;
     state.deaths = snap.p[i + 4]!;
     state.knockouts = snap.p[i + 5]!;
-    state.alive = snap.p[i + 6] === 1;
+    const alive = snap.p[i + 6] === 1;
+    if (alive !== state.alive) world.setBodyEnabled(state.id, alive);
+    state.alive = alive;
     state.roundWins = snap.p[i + 7]!;
   }
 }
@@ -170,7 +223,9 @@ function applyMatch(world: SimWorld, snap: SnapshotMessage): void {
   world.match.phase = MATCH_PHASES[m[0]!] ?? 'playing';
   world.match.timer = m[1]!;
   world.match.round = m[2]!;
-  world.match.arenaRadius = m[3]!;
+  // Through the setter, so the client's platform collider shrinks with the
+  // server's. Otherwise a predicting player walks on floor that is not there.
+  world.setArenaRadius(m[3]!);
   world.match.lastWinner = m[4]!;
   world.match.champion = m[5]!;
 }

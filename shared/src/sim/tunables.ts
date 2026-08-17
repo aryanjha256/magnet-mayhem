@@ -54,6 +54,20 @@ export interface Tunables {
   /** Radius the platform closes down to. */
   arenaMinRadius: number;
 
+  // --- camera ---
+  /** Degrees above the horizon. 90 is straight down, 45 is isometric. */
+  cameraTiltDeg: number;
+  /** Framing slack around the arena. 1 is a tight fit. */
+  cameraMargin: number;
+
+  // --- net ---
+  /** 1 to locally own the bodies your magnet is holding. 0 for server-only. */
+  predictObjects: number;
+  /** Ticks a released body takes to drift back to the server's version. */
+  objectBlendTicks: number;
+  /** Metres of disagreement before a predicted body is handed back. */
+  objectDivergenceLimit: number;
+
   // --- world ---
   gravity: number;
   /** Fall below this and you respawn. */
@@ -88,6 +102,13 @@ export const TUNABLES: Tunables = {
   shrinkGraceSeconds: 15,
   shrinkSeconds: 45,
   arenaMinRadius: 3,
+
+  cameraTiltDeg: 52,
+  cameraMargin: 1.18,
+
+  predictObjects: 1,
+  objectBlendTicks: 18,
+  objectDivergenceLimit: 3,
 
   gravity: -26,
   killY: -25,
@@ -124,6 +145,13 @@ export const TUNABLE_SPECS: readonly TunableSpec[] = [
   { key: 'shrinkGraceSeconds', group: 'Match', label: 'Shrink delay (s)', kind: 'range', min: 0, max: 60, step: 1 },
   { key: 'shrinkSeconds', group: 'Match', label: 'Shrink duration (s)', kind: 'range', min: 5, max: 120, step: 5 },
   { key: 'arenaMinRadius', group: 'Match', label: 'Final radius', kind: 'range', min: 1.5, max: 8, step: 0.25 },
+
+  { key: 'cameraTiltDeg', group: 'Camera', label: 'Tilt', kind: 'range', min: 25, max: 90, step: 1 },
+  { key: 'cameraMargin', group: 'Camera', label: 'Framing', kind: 'range', min: 1, max: 2.2, step: 0.02 },
+
+  { key: 'predictObjects', group: 'Net', label: 'Predict objects', kind: 'range', min: 0, max: 1, step: 1 },
+  { key: 'objectBlendTicks', group: 'Net', label: 'Hand-back blend', kind: 'range', min: 1, max: 60, step: 1 },
+  { key: 'objectDivergenceLimit', group: 'Net', label: 'Give-up distance', kind: 'range', min: 0.5, max: 10, step: 0.5 },
 
   { key: 'gravity', group: 'World', label: 'Gravity', kind: 'range', min: -60, max: 0, step: 1 },
 ];
