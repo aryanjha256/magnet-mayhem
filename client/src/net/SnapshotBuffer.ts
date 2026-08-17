@@ -1,4 +1,5 @@
 import { BODY_STRIDE, PLAYER_STRIDE, type SnapshotMessage } from '@magnet/shared/net/protocol';
+import { MATCH_PHASES } from '@magnet/shared/sim/Match';
 import type { SimWorld } from '@magnet/shared/sim/World';
 
 /**
@@ -103,6 +104,7 @@ export class SnapshotBuffer {
     const alpha = span > 0 ? (this.renderTick - a.tick) / span : 0;
     applyBodies(world, a, b, alpha);
     applyPlayers(world, newest);
+    applyMatch(world, newest);
     applyLinks(world, newest);
   }
 }
@@ -156,7 +158,21 @@ function applyPlayers(world: SimWorld, snap: SnapshotMessage): void {
     state.aimZ = snap.p[i + 3]!;
     state.deaths = snap.p[i + 4]!;
     state.knockouts = snap.p[i + 5]!;
+    state.alive = snap.p[i + 6] === 1;
+    state.roundWins = snap.p[i + 7]!;
   }
+}
+
+/** The server owns the round clock; the client only mirrors it. */
+function applyMatch(world: SimWorld, snap: SnapshotMessage): void {
+  const m = snap.m;
+  if (m.length < 6) return;
+  world.match.phase = MATCH_PHASES[m[0]!] ?? 'playing';
+  world.match.timer = m[1]!;
+  world.match.round = m[2]!;
+  world.match.arenaRadius = m[3]!;
+  world.match.lastWinner = m[4]!;
+  world.match.champion = m[5]!;
 }
 
 function applyLinks(world: SimWorld, snap: SnapshotMessage): void {

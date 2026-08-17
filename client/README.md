@@ -134,6 +134,27 @@ Deliberately *not* built yet: any network abstraction, serialization, or
 client/server split. Those get guessed wrong when there's no server to test
 against.
 
+## Rounds
+
+A match is a series of rounds; first to `roundsToWin` (3) takes it.
+
+- **Elimination.** Fall during a round and you are out until the next one. This
+  is what gives the magnet stakes — before it, a knockout cost five seconds.
+- **Countdown.** Input is frozen for 2.5s at the start of each round, so nobody
+  can shove through the bell.
+- **Shrinking arena.** After a 15s grace the disc closes from 9m to 3m over 45s,
+  which forces a conclusion. Two cautious players — and the bots are *very*
+  good at not dying — would otherwise circle forever.
+- **Timeout.** If the round clock runs out with several alive, the player
+  nearest the middle takes it. Arbitrary, but deterministic and never a draw.
+
+The arena is a disc rather than a square: ring-out on a square has awkward
+corners, and the shrink wants a radius. Bots read the live radius, not a
+constant, so they retreat as the floor closes in.
+
+`new SimWorld(seed, { match: false })` gives the old endless sandbox, which is
+what the isolated physics measurements use.
+
 ## Dummy players
 
 Three opponents share the arena, each answering one question the single-player

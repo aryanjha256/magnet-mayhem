@@ -6,11 +6,13 @@ import type { ClientMessage, ServerMessage } from '@magnet/shared/net/protocol';
 import { Room } from './Room';
 
 const PORT = Number(process.env.PORT ?? 8080);
+/** `BOTS=3 npm run serve` fills the room so it is playable solo. */
+const BOTS = Number(process.env.BOTS ?? 0);
 
 async function main(): Promise<void> {
   await initSim();
 
-  const room = new Room();
+  const room = new Room(BOTS);
   const wss = new WebSocketServer({ port: PORT });
 
   wss.on('connection', (socket: WebSocket) => {

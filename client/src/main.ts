@@ -6,6 +6,8 @@ import { InputSource } from './input/InputSource';
 import { Connection } from './net/Connection';
 import { SnapshotBuffer } from './net/SnapshotBuffer';
 import { Renderer } from './render/Renderer';
+import { BotDirector } from '@magnet/shared/sim/Bot';
+import type { Input } from '@magnet/shared/sim/input';
 import type { EntityId } from '@magnet/shared/sim/types';
 import { initSim, SimWorld, TICK_DT } from '@magnet/shared/sim/World';
 
@@ -37,7 +39,7 @@ async function main(): Promise<void> {
   // transforms overwritten by snapshots. Same class either way, so the renderer
   // and HUD cannot tell the difference.
   let world = online
-    ? new SimWorld(0x5eed, { dummies: false, players: 0 })
+    ? new SimWorld(0x5eed, { players: 0, bots: 0 })
     : new SimWorld();
 
   const canvas = requireEl<HTMLCanvasElement>('#viewport');
@@ -81,6 +83,8 @@ async function main(): Promise<void> {
   let previous = performance.now();
   let pendingDash = false;
   let pendingReset = false;
+  const tickInputs = new Map<EntityId, Input>();
+  const bots = new BotDirector();
 
   /**
    * Fixed timestep. The sim only ever advances in whole TICK_DT steps and only
@@ -155,7 +159,9 @@ async function main(): Promise<void> {
         ? renderer.screenToGround(input.raw.ndcX, input.raw.ndcY, world.player.pos.y)
         : null;
 
-      world.step(
+      tickInputs.clear();
+      tickInputs.set(
+        world.playerId,
         buildInput(
           world.tick + 1,
           input.raw,
@@ -166,6 +172,8 @@ async function main(): Promise<void> {
           lastAim,
         ),
       );
+      bots.drive(world, tickInputs);
+      world.step(tickInputs);
       // One press must not dash on every catch-up tick of the same frame.
       pendingDash = false;
 

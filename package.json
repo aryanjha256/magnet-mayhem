@@ -13,6 +13,7 @@
     "serve": "npm run dev --workspace server",
     "smoke": "npm run smoke --workspace client",
     "typecheck": "npm run typecheck --workspace shared && npm run typecheck --workspace client && npm run typecheck --workspace server",
-    "build": "npm run build --workspace client"
+    "build": "npm run build --workspace client",
+    "balance": "npm run balance --workspace client"
   }
 }

@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 
-import { PLATFORM_HALF } from '@magnet/shared/sim/arena';
+import { PLATFORM_RADIUS } from '@magnet/shared/sim/arena';
 import { TUNABLES } from '@magnet/shared/sim/tunables';
 import type { Entity, EntityId, Vec3 } from '@magnet/shared/sim/types';
 import type { SimWorld } from '@magnet/shared/sim/World';
@@ -122,6 +122,8 @@ export class Renderer {
       mesh.quaternion.slerpQuaternions(this.qa, this.qb, alpha);
     }
 
+    this.updateArena(world);
+    this.updateElimination(world);
     this.updateTethers(world);
 
     const viewMesh = this.meshes.get(viewId);
@@ -148,6 +150,33 @@ export class Renderer {
     this.renderer.setSize(w, h, false);
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
+  }
+
+  /** Scale the platform mesh to match the collider the sim is shrinking. */
+  private updateArena(world: SimWorld): void {
+    const platform = world.entities.find((e) => e.kind === 'platform');
+    if (!platform) return;
+    const mesh = this.meshes.get(platform.id);
+    if (!mesh || platform.shape.type !== 'cylinder') return;
+    const scale = world.arenaRadius / platform.shape.radius;
+    mesh.scale.set(scale, 1, scale);
+  }
+
+  /** Eliminated players stay on screen as ghosts rather than vanishing. */
+  private updateElimination(world: SimWorld): void {
+    for (const state of world.players.values()) {
+      const mesh = this.meshes.get(state.id);
+      if (!mesh) continue;
+      const material = mesh.material as THREE.MeshStandardMaterial;
+      if (state.alive) {
+        mesh.visible = true;
+        material.opacity = 1;
+        material.transparent = false;
+      } else {
+        // Parked far below by the sim; hide rather than draw a body in the void.
+        mesh.visible = false;
+      }
+    }
   }
 
   /** Drop meshes for entities that have left, e.g. a disconnected player. */
@@ -239,7 +268,7 @@ export class Renderer {
     sun.position.set(14, 30, 12);
     sun.castShadow = true;
     sun.shadow.mapSize.set(2048, 2048);
-    const extent = PLATFORM_HALF.x + 6;
+    const extent = PLATFORM_RADIUS + 6;
     const cam = sun.shadow.camera;
     cam.left = -extent;
     cam.right = extent;
@@ -268,6 +297,10 @@ function geometryFor(entity: Entity): THREE.BufferGeometry {
   if (entity.shape.type === 'sphere') {
     return new THREE.SphereGeometry(entity.shape.radius, 28, 18);
   }
+  if (entity.shape.type === 'cylinder') {
+    const { radius, halfHeight } = entity.shape;
+    return new THREE.CylinderGeometry(radius, radius, halfHeight * 2, 64);
+  }
   return new THREE.BoxGeometry(entity.shape.hx * 2, entity.shape.hy * 2, entity.shape.hz * 2);
 }
 
@@ -275,24 +308,18 @@ function materialFor(entity: Entity): THREE.Material {
   switch (entity.kind) {
     case 'platform':
       return new THREE.MeshStandardMaterial({ color: 0x232834, roughness: 0.95, metalness: 0.05 });
-    case 'player':
+    case 'player': {
+      // One hue per spawn slot. Everyone is the same silhouette, so colour is
+      // the only thing separating you from three bots in a scrum.
+      const tint = entity.tint || 0xffb347;
       return new THREE.MeshStandardMaterial({
-        color: 0xffb347,
-        emissive: 0xff6a1f,
-        emissiveIntensity: 0.55,
+        color: tint,
+        emissive: tint,
+        emissiveIntensity: 0.45,
         roughness: 0.4,
         metalness: 0.3,
       });
-    case 'dummy':
-      // Same silhouette as the player, different hue per behaviour, and dimmer
-      // emissive so you can always tell which one is you.
-      return new THREE.MeshStandardMaterial({
-        color: entity.tint || 0x8f9bb3,
-        emissive: entity.tint || 0x8f9bb3,
-        emissiveIntensity: 0.22,
-        roughness: 0.45,
-        metalness: 0.3,
-      });
+    }
     case 'crate':
       return new THREE.MeshStandardMaterial({ color: 0x54606f, roughness: 0.55, metalness: 0.75 });
     case 'ball':

@@ -1,5 +1,6 @@
 import type { GamepadState } from '../input/GamepadSource';
 import { TICK_RATE } from '@magnet/shared/sim/World';
+import { TUNABLES } from '@magnet/shared/sim/tunables';
 import type { SimWorld } from '@magnet/shared/sim/World';
 import type { EntityId } from '@magnet/shared/sim/types';
 
@@ -33,7 +34,23 @@ export class Hud {
         ? 'off'
         : `${axis < 0 ? 'ATTRACT' : 'REPEL'} ${(Math.abs(axis) * 100).toFixed(0)}%`;
 
+    const m = world.match;
+    const alive = world.alivePlayers.length;
+    const seconds = (m.timer / TICK_RATE).toFixed(1);
+    const status =
+      m.phase === 'countdown'
+        ? `round ${m.round} in ${seconds}s`
+        : m.phase === 'playing'
+          ? `round ${m.round}  ${alive} left  ${seconds}s`
+          : m.phase === 'roundOver'
+            ? m.lastWinner === viewId ? 'ROUND WON' : `round to #${m.lastWinner}`
+            : m.champion === viewId ? 'MATCH WON' : `match to #${m.champion}`;
+
     const lines = [
+      status,
+      `wins   ${view?.roundWins ?? 0} / ${TUNABLES.roundsToWin}`,
+      `arena  ${m.arenaRadius.toFixed(1)}m`,
+      view?.alive === false ? 'ELIMINATED' : '',
       `fps    ${this.fps.toFixed(0)}`,
       `tick   ${world.tick}`,
       `speed  ${speed.toFixed(1)} m/s`,
@@ -57,7 +74,7 @@ export class Hud {
       );
     }
 
-    this.el.textContent = lines.join('\n');
+    this.el.textContent = lines.filter((l) => l !== '').join('\n');
   }
 }
 

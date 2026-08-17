@@ -2,12 +2,12 @@ import RAPIER from '@dimforge/rapier3d-compat';
 
 import {
   ARENA_BODIES,
-  ARENA_DUMMIES,
+  PLATFORM_RADIUS,
   PLAYER_MASS,
   PLAYER_RADIUS,
   type BodySpec,
 } from './arena';
-import { decideDummy, type DummyBehavior } from './Dummy';
+import type { MatchState } from './Match';
 import { emptyInput, type Input } from './input';
 import { falloff, inCone } from './magnet';
 import { Rng } from './rng';
@@ -22,6 +22,10 @@ import {
 } from './types';
 
 export const TICK_RATE = 60;
+/** Fixed phase lengths. Only the round cap and shrink curve are tunable. */
+const COUNTDOWN_SECONDS = 2.5;
+const ROUND_OVER_SECONDS = 3;
+const MATCH_OVER_SECONDS = 6;
 export const TICK_DT = 1 / TICK_RATE;
 
 let rapierReady = false;
@@ -41,15 +45,24 @@ function removeWhere<T>(list: T[], predicate: (item: T) => boolean): void {
 }
 
 export interface WorldOptions {
-  /**
-   * Spawn the practice dummies. Turn off to measure one magnet in isolation —
-   * with them present the grabber tows the player around, which quietly
-   * contaminates any single-actor measurement.
-   */
-  dummies: boolean;
-  /** Players to spawn up front. The server starts at 0 and adds on connect. */
+  /** Human players to spawn up front. A server starts at 0 and adds on connect. */
   players: number;
+  /**
+   * Bot players to spawn. Set 0 to measure one magnet in isolation — bots move
+   * and shove, which quietly contaminates any single-actor measurement.
+   */
+  bots: number;
+  /**
+   * Run rounds, elimination and the shrinking arena. Off gives the endless
+   * sandbox, which is what the isolated physics measurements need.
+   */
+  match: boolean;
 }
+
+/** One colour per spawn slot, so players and bots are told apart at a glance. */
+const PLAYER_TINTS: readonly number[] = [
+  0xffb347, 0x6fd3ff, 0xc678dd, 0x56c98a, 0xff7a9c, 0xffe066, 0x8f9bb3, 0xff8f5a,
+];
 
 /** Spawn ring, so players never start on top of each other or on a ball. */
 const PLAYER_SPAWNS: readonly Vec3[] = [
@@ -63,7 +76,7 @@ const PLAYER_SPAWNS: readonly Vec3[] = [
   { x: 1.5, y: 2, z: 3.5 },
 ];
 
-const DEFAULT_OPTIONS: WorldOptions = { dummies: true, players: 1 };
+const DEFAULT_OPTIONS: WorldOptions = { players: 1, bots: 2, match: true };
 
 /** Per-player state that used to be fields on the world itself. */
 export interface PlayerState {
@@ -77,7 +90,12 @@ export interface PlayerState {
   deaths: number;
   /** Other players and dummies this one knocked into the void. */
   knockouts: number;
+  /** False once eliminated. Stays false until the next round starts. */
+  alive: boolean;
+  roundWins: number;
   readonly velocity: Vec3;
+  /** Driven by `BotDirector` rather than a socket. The sim treats both alike. */
+  readonly isBot: boolean;
 }
 
 /**
@@ -98,15 +116,24 @@ export class SimWorld {
   /** Every magnet-target pair active this tick. Rebuilt from scratch each step. */
   readonly links: MagnetLink[] = [];
 
+  readonly match: MatchState = {
+    phase: 'countdown',
+    timer: 0,
+    round: 1,
+    elapsed: 0,
+    lastWinner: 0,
+    champion: 0,
+    arenaRadius: PLATFORM_RADIUS,
+    startedWith: 0,
+  };
+
+  private readonly matchEnabled: boolean;
+  private platformCollider: RAPIER.Collider | null = null;
+
   private readonly physics: RAPIER.World;
   private readonly bodies = new Map<EntityId, RAPIER.RigidBody>();
   /** Dynamic bodies only, in entity order — the per-tick hot loop. */
   private readonly dynamics: { entity: Entity; body: RAPIER.RigidBody }[] = [];
-  private readonly dummies: {
-    entity: Entity;
-    body: RAPIER.RigidBody;
-    behavior: DummyBehavior;
-  }[] = [];
   private readonly rng: Rng;
   private nextId = 1;
   private spawnCursor = 0;
@@ -119,21 +146,23 @@ export class SimWorld {
       throw new Error('initSim() must be awaited before constructing SimWorld');
     }
     this.rng = new Rng(seed);
+    this.matchEnabled = opts.match;
     this.physics = new RAPIER.World({ x: 0, y: TUNABLES.gravity, z: 0 });
     this.physics.timestep = TICK_DT;
 
     for (const spec of ARENA_BODIES) this.addBody(spec);
     for (let i = 0; i < opts.players; i++) this.addPlayer();
+    for (let i = 0; i < opts.bots; i++) this.addPlayer(undefined, true);
+    if (this.matchEnabled) this.beginRound(1);
+  }
 
-    if (!opts.dummies) return;
-    for (const spec of ARENA_DUMMIES) {
-      const entity = this.addBody(spec);
-      this.dummies.push({
-        entity,
-        body: this.bodies.get(entity.id)!,
-        behavior: spec.behavior,
-      });
-    }
+  /** Current platform radius. Bots steer by this, not by a constant. */
+  get arenaRadius(): number {
+    return this.match.arenaRadius;
+  }
+
+  get alivePlayers(): PlayerState[] {
+    return [...this.players.values()].filter((p) => p.alive);
   }
 
   /**
@@ -159,8 +188,9 @@ export class SimWorld {
    * Add a player mid-run. `id` lets a client mirror ids the server assigned;
    * without it the world allocates its own.
    */
-  addPlayer(id?: EntityId): PlayerState {
-    const spawn = PLAYER_SPAWNS[this.spawnCursor % PLAYER_SPAWNS.length]!;
+  addPlayer(id?: EntityId, isBot = false): PlayerState {
+    const index = this.spawnCursor % PLAYER_SPAWNS.length;
+    const spawn = PLAYER_SPAWNS[index]!;
     this.spawnCursor++;
 
     const entity = this.addBody(
@@ -176,7 +206,7 @@ export class SimWorld {
         friction: 0.2,
         restitution: 0.1,
         lockRotations: true,
-        tint: 0,
+        tint: PLAYER_TINTS[index % PLAYER_TINTS.length]!,
       },
       id,
     );
@@ -190,7 +220,10 @@ export class SimWorld {
       dashCooldown: 0,
       deaths: 0,
       knockouts: 0,
+      alive: true,
+      roundWins: 0,
       velocity: vec3(),
+      isBot,
     };
     this.players.set(entity.id, state);
     return state;
@@ -207,12 +240,6 @@ export class SimWorld {
     this.bodies.delete(id);
     removeWhere(this.entities, (e) => e.id === id);
     removeWhere(this.dynamics, (d) => d.entity.id === id);
-  }
-
-  /** Swap a dummy's behaviour mid-run. Used by the smoke checks as a control. */
-  setDummyBehavior(id: EntityId, behavior: DummyBehavior): void {
-    const dummy = this.dummies.find((d) => d.entity.id === id);
-    if (dummy) dummy.behavior = behavior;
   }
 
   /**
@@ -254,10 +281,16 @@ export class SimWorld {
     // Every player is resolved against the same start-of-tick state, so the
     // order they are stored in cannot change the outcome — which matters once
     // a server is replaying inputs that arrived in an arbitrary order.
+    // Nobody acts outside a live round: a countdown you can shove through is
+    // not a countdown, and the eliminated should not keep playing.
+    const frozen = this.matchEnabled && this.match.phase !== 'playing';
+
     for (const state of this.players.values()) {
       const body = this.bodies.get(state.id);
-      if (!body) continue;
-      const input = byPlayer.get(state.id) ?? emptyInput(this.tick);
+      if (!body || !state.alive) continue;
+      const input = frozen
+        ? emptyInput(this.tick)
+        : (byPlayer.get(state.id) ?? emptyInput(this.tick));
 
       state.magnetAxis = input.magnet;
       state.aimX = input.aimX;
@@ -267,42 +300,10 @@ export class SimWorld {
       this.applyMagnet(state.entity, body, input.aimX, input.aimZ, input.magnet);
     }
 
-    // Dummies decide from the state at the top of the tick, so the order they
-    // are evaluated in cannot change the outcome.
-    //
-    // They fire a focused beam at the player rather than a wide cone. That is
-    // what makes each one a controlled experiment instead of a fourth source
-    // of chaos: a cone this wide sprays every nearby body, and the source eats
-    // a reaction from each, which flings the dummy off the map before you can
-    // feel what it was demonstrating. Real players in Phase 4 use the same
-    // call without the focus argument.
-    // Dummies exist for the solo sandbox and always track the first player.
-    const target = this.players.values().next().value;
-    if (target) {
-      const targetMagnet = byPlayer.get(target.id)?.magnet ?? 0;
-      for (const dummy of this.dummies) {
-        const command = decideDummy(
-          dummy.behavior,
-          this.tick,
-          dummy.entity.pos,
-          target.entity.pos,
-          targetMagnet,
-        );
-        if (command.magnet === 0) continue;
-        this.applyMagnet(
-          dummy.entity,
-          dummy.body,
-          command.aimX,
-          command.aimZ,
-          command.magnet,
-          target.id,
-        );
-      }
-    }
-
     this.physics.step();
     this.readBack();
     this.respawnFallen();
+    if (this.matchEnabled) this.updateMatch();
   }
 
   private applyMovement(state: PlayerState, player: RAPIER.RigidBody, input: Input): void {
@@ -340,11 +341,11 @@ export class SimWorld {
   /**
    * Apply one magnet's pull to everything in its cone.
    *
-   * Takes an explicit source rather than assuming the player, because dummies
-   * (and, later, remote players) run exactly the same code. Two magnets acting
-   * on each other with opposing polarity therefore cancel exactly, which is
-   * what makes a tug-of-war a real stalemate instead of a slow win for whoever
-   * the engine happens to evaluate first.
+   * Takes an explicit source rather than assuming a particular player, because
+   * every actor — human, bot, remote — runs exactly this code. Two magnets
+   * acting on each other with opposing polarity therefore cancel exactly, which
+   * is what makes a tug-of-war a real stalemate rather than a slow win for
+   * whoever the engine happens to evaluate first.
    */
   private applyMagnet(
     sourceEntity: Entity,
@@ -352,7 +353,6 @@ export class SimWorld {
     aimX: number,
     aimZ: number,
     axis: number,
-    focusTargetId: EntityId | null = null,
   ): void {
     if (axis === 0) return;
     const t = TUNABLES;
@@ -362,7 +362,6 @@ export class SimWorld {
 
     for (const { entity, body } of this.dynamics) {
       if (!entity.magnetic || entity.id === sourceEntity.id) continue;
-      if (focusTargetId !== null && entity.id !== focusTargetId) continue;
 
       const p = body.translation();
       const dx = p.x - origin.x;
@@ -415,32 +414,163 @@ export class SimWorld {
     }
   }
 
+  /** Reset the arena and everyone in it, then run the countdown. */
+  private beginRound(round: number): void {
+    const m = this.match;
+    m.phase = 'countdown';
+    m.round = round;
+    m.timer = Math.round(COUNTDOWN_SECONDS * TICK_RATE);
+    m.elapsed = 0;
+    m.lastWinner = 0;
+    m.arenaRadius = PLATFORM_RADIUS;
+    this.applyArenaRadius(PLATFORM_RADIUS);
+
+    for (const { entity, body } of this.dynamics) {
+      const player = this.players.get(entity.id);
+      if (player) {
+        player.alive = true;
+        body.setEnabled(true);
+      }
+      this.respawn(entity, body);
+    }
+    m.startedWith = this.players.size;
+  }
+
+  private updateMatch(): void {
+    const m = this.match;
+    if (m.timer > 0) m.timer--;
+
+    switch (m.phase) {
+      case 'countdown':
+        if (m.timer <= 0) {
+          m.phase = 'playing';
+          m.timer = Math.round(TUNABLES.roundSeconds * TICK_RATE);
+          m.elapsed = 0;
+        }
+        break;
+
+      case 'playing': {
+        m.elapsed++;
+        this.updateShrink();
+
+        // A server room is empty when its first round begins, so the count has
+        // to track joins or a round could never be won.
+        if (this.players.size > m.startedWith) m.startedWith = this.players.size;
+
+        const alive = this.alivePlayers;
+        // A solo world never wins by being last standing, or the tuning
+        // sandbox would end its round the instant it started.
+        const decided = m.startedWith >= 2 && alive.length <= 1;
+        if (decided || m.timer <= 0) this.endRound(alive);
+        break;
+      }
+
+      case 'roundOver':
+        if (m.timer <= 0) {
+          const champion = [...this.players.values()].find(
+            (p) => p.roundWins >= TUNABLES.roundsToWin,
+          );
+          if (champion) {
+            m.champion = champion.id;
+            m.phase = 'matchOver';
+            m.timer = Math.round(MATCH_OVER_SECONDS * TICK_RATE);
+          } else {
+            this.beginRound(m.round + 1);
+          }
+        }
+        break;
+
+      case 'matchOver':
+        if (m.timer <= 0) {
+          for (const p of this.players.values()) p.roundWins = 0;
+          m.champion = 0;
+          this.beginRound(1);
+        }
+        break;
+    }
+  }
+
+  private endRound(alive: PlayerState[]): void {
+    const m = this.match;
+    // On a timeout with several survivors the player nearest the middle takes
+    // it — arbitrary, but deterministic and never a stalemate.
+    let winner: PlayerState | null = null;
+    if (alive.length === 1) {
+      winner = alive[0]!;
+    } else if (alive.length > 1) {
+      let best = Infinity;
+      for (const p of alive) {
+        const d = Math.hypot(p.entity.pos.x, p.entity.pos.z);
+        if (d < best) {
+          best = d;
+          winner = p;
+        }
+      }
+    }
+
+    if (winner) {
+      winner.roundWins++;
+      m.lastWinner = winner.id;
+    }
+    m.phase = 'roundOver';
+    m.timer = Math.round(ROUND_OVER_SECONDS * TICK_RATE);
+  }
+
+  /** Close the platform in, so a cautious pair cannot circle forever. */
+  private updateShrink(): void {
+    const grace = TUNABLES.shrinkGraceSeconds * TICK_RATE;
+    const span = Math.max(1, TUNABLES.shrinkSeconds * TICK_RATE);
+    const progress = Math.min(1, Math.max(0, (this.match.elapsed - grace) / span));
+    const radius = PLATFORM_RADIUS + (TUNABLES.arenaMinRadius - PLATFORM_RADIUS) * progress;
+
+    if (Math.abs(radius - this.match.arenaRadius) < 1e-4) return;
+    this.match.arenaRadius = radius;
+    this.applyArenaRadius(radius);
+  }
+
+  private applyArenaRadius(radius: number): void {
+    this.platformCollider?.setRadius(radius);
+  }
+
   private respawnFallen(): void {
+    const eliminating = this.matchEnabled && this.match.phase === 'playing';
+
     for (const { entity, body } of this.dynamics) {
       if (entity.pos.y > TUNABLES.killY) continue;
 
       const fallen = this.players.get(entity.id);
+      // Already out: its body is parked below the arena, so without this the
+      // death counter would tick up every frame for the rest of the round.
+      if (fallen && !fallen.alive) continue;
       if (fallen) {
         fallen.deaths++;
-      } else if (entity.kind === 'dummy') {
-        // No kill attribution yet: with one human it is unambiguous, and
-        // crediting the right player needs last-touched tracking.
-        const first = this.players.values().next().value;
-        if (first) first.knockouts++;
+        if (eliminating) {
+          // Out for the rest of the round. Disabling the body is what makes a
+          // shove matter: there is no five-second reprieve any more.
+          fallen.alive = false;
+          body.setEnabled(false);
+          continue;
+        }
       }
       this.respawn(entity, body);
     }
   }
 
   private respawn(entity: Entity, body: RAPIER.RigidBody): void {
-    // Deterministic jitter so re-dropped balls do not stack into a tower.
     const isPlayer = this.players.has(entity.id);
+
+    // Players come back at whichever spawn slot is furthest from everyone
+    // else. A fixed slot drops you straight back into the scrum that just
+    // killed you, and chain deaths read as the game being unfair.
+    const origin = isPlayer ? this.safestSpawn(entity.id) : entity.spawn;
+
+    // Deterministic jitter so re-dropped balls do not stack into a tower.
     const jitterX = isPlayer ? 0 : this.rng.range(-1.2, 1.2);
     const jitterZ = isPlayer ? 0 : this.rng.range(-1.2, 1.2);
     const target = {
-      x: entity.spawn.x + jitterX,
-      y: entity.spawn.y + 2,
-      z: entity.spawn.z + jitterZ,
+      x: origin.x + jitterX,
+      y: origin.y + 2,
+      z: origin.z + jitterZ,
     };
 
     body.setTranslation(target, true);
@@ -454,6 +584,26 @@ export class SimWorld {
     // Snap history too, or the renderer lerps across the whole teleport.
     entity.prevPos = { ...target };
     entity.prevRot = quatIdentity();
+  }
+
+  /** The spawn slot with the largest distance to the nearest other player. */
+  private safestSpawn(exceptId: EntityId): Vec3 {
+    let best = PLAYER_SPAWNS[0]!;
+    let bestClearance = -1;
+
+    for (const slot of PLAYER_SPAWNS) {
+      let nearest = Infinity;
+      for (const other of this.players.values()) {
+        if (other.id === exceptId) continue;
+        const d = Math.hypot(other.entity.pos.x - slot.x, other.entity.pos.z - slot.z);
+        if (d < nearest) nearest = d;
+      }
+      if (nearest > bestClearance) {
+        bestClearance = nearest;
+        best = slot;
+      }
+    }
+    return best;
   }
 
   private addBody(spec: BodySpec, forcedId?: EntityId): Entity {
@@ -471,7 +621,9 @@ export class SimWorld {
     const collider =
       spec.shape.type === 'sphere'
         ? RAPIER.ColliderDesc.ball(spec.shape.radius)
-        : RAPIER.ColliderDesc.cuboid(spec.shape.hx, spec.shape.hy, spec.shape.hz);
+        : spec.shape.type === 'cylinder'
+          ? RAPIER.ColliderDesc.cylinder(spec.shape.halfHeight, spec.shape.radius)
+          : RAPIER.ColliderDesc.cuboid(spec.shape.hx, spec.shape.hy, spec.shape.hz);
     collider.setFriction(spec.friction).setRestitution(spec.restitution);
     // Rapier averages the two colliders' friction by default, which silently
     // averages away the player's deliberately-low grip against the platform's
@@ -479,7 +631,8 @@ export class SimWorld {
     // each body's own friction is the one that governs.
     collider.setFrictionCombineRule(RAPIER.CoefficientCombineRule.Min);
     if (!spec.static) collider.setMass(spec.mass);
-    this.physics.createCollider(collider, body);
+    const created = this.physics.createCollider(collider, body);
+    if (spec.kind === 'platform') this.platformCollider = created;
 
     // A client mirroring a server room must reuse the server's ids, or the two
     // sides disagree about which body a snapshot is describing.

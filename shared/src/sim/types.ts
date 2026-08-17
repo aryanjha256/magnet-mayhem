@@ -5,12 +5,13 @@
 
 export type EntityId = number;
 
-export type EntityKind = 'player' | 'dummy' | 'ball' | 'crate' | 'platform';
+export type EntityKind = 'player' | 'ball' | 'crate' | 'platform';
 
 /** Render hint only — the sim uses the collider, not this. */
 export type Shape =
   | { type: 'sphere'; radius: number }
-  | { type: 'box'; hx: number; hy: number; hz: number };
+  | { type: 'box'; hx: number; hy: number; hz: number }
+  | { type: 'cylinder'; radius: number; halfHeight: number };
 
 export interface Vec3 {
   x: number;

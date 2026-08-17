@@ -1,3 +1,4 @@
+import { BotDirector } from '@magnet/shared/sim/Bot';
 import { emptyInput, type Input } from '@magnet/shared/sim/input';
 import type { EntityId } from '@magnet/shared/sim/types';
 import { SimWorld, TICK_RATE } from '@magnet/shared/sim/World';
@@ -33,11 +34,12 @@ export class Room {
    * the right failure mode for a held button.
    */
   private readonly inputs = new Map<EntityId, Input>();
+  private readonly bots = new BotDirector();
 
-  constructor() {
-    // No dummies online: they are a solo practice tool, and they would fight
-    // whichever player happened to join first.
-    this.world = new SimWorld(0x5eed, { dummies: false, players: 0 });
+  constructor(bots = 0) {
+    // Players arrive over the socket; bots are optional room filler so a room
+    // is playable before anyone else shows up.
+    this.world = new SimWorld(0x5eed, { players: 0, bots });
   }
 
   get playerCount(): number {
@@ -91,6 +93,9 @@ export class Room {
 
   /** One fixed sim step, plus a snapshot on the broadcast cadence. */
   tick(): void {
+    // Bots are written into the same map the sockets feed, so the sim has no
+    // idea which entries came from a human.
+    this.bots.drive(this.world, this.inputs);
     this.world.step(this.inputs);
 
     // A dash is an edge, not a state: without clearing it here a single press

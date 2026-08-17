@@ -1,4 +1,5 @@
 import type { SimWorld } from '../sim/World';
+import { MATCH_PHASES } from '../sim/Match';
 import type { EntityId } from '../sim/types';
 
 /**
@@ -57,15 +58,17 @@ export interface SnapshotMessage {
   b: number[];
   /** [sourceId, targetId, force] per magnet link. */
   l: number[];
-  /** [id, magnetAxis, aimX, aimZ, deaths, knockouts] per player. */
+  /** [id, magnetAxis, aimX, aimZ, deaths, knockouts, alive, roundWins] per player. */
   p: number[];
+  /** [phaseIndex, timer, round, arenaRadius, lastWinner, champion]. */
+  m: number[];
 }
 
 export type ServerMessage = WelcomeMessage | JoinMessage | LeaveMessage | SnapshotMessage;
 
 export const BODY_STRIDE = 8;
 export const LINK_STRIDE = 3;
-export const PLAYER_STRIDE = 6;
+export const PLAYER_STRIDE = 8;
 
 export function encodeSnapshot(world: SimWorld): SnapshotMessage {
   const b: number[] = [];
@@ -88,8 +91,27 @@ export function encodeSnapshot(world: SimWorld): SnapshotMessage {
 
   const p: number[] = [];
   for (const state of world.players.values()) {
-    p.push(state.id, state.magnetAxis, state.aimX, state.aimZ, state.deaths, state.knockouts);
+    p.push(
+      state.id,
+      state.magnetAxis,
+      state.aimX,
+      state.aimZ,
+      state.deaths,
+      state.knockouts,
+      state.alive ? 1 : 0,
+      state.roundWins,
+    );
   }
 
-  return { t: 'snap', tick: world.tick, b, l, p };
+  const match = world.match;
+  const m = [
+    MATCH_PHASES.indexOf(match.phase),
+    match.timer,
+    match.round,
+    match.arenaRadius,
+    match.lastWinner,
+    match.champion,
+  ];
+
+  return { t: 'snap', tick: world.tick, b, l, p, m };
 }

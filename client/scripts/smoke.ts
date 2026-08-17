@@ -11,15 +11,15 @@ import type { RawInput } from '../src/input/InputSource';
 import { emptyInput, type Input } from '@magnet/shared/sim/input';
 import { TUNABLES, type Tunables } from '@magnet/shared/sim/tunables';
 import { initSim, SimWorld, TICK_RATE } from '@magnet/shared/sim/World';
-import type { Entity, EntityId } from '@magnet/shared/sim/types';
+import { PLATFORM_RADIUS } from '@magnet/shared/sim/arena';
+import type { Entity, EntityId, Vec3 } from '@magnet/shared/sim/types';
 
 const SEED = 0x5eed;
 /**
- * Worlds for measuring one magnet in isolation. With the dummies present the
- * grabber tows the player off the origin during the settle, which silently
- * corrupts every single-actor measurement below.
+ * Worlds for measuring one magnet in isolation. With bots present they move and
+ * shove, which silently corrupts every single-actor measurement below.
  */
-const SOLO = { dummies: false } as const;
+const SOLO = { bots: 0, match: false } as const;
 
 let passed = 0;
 let failed = 0;
@@ -77,8 +77,8 @@ async function main(): Promise<void> {
   section('World construction');
   {
     const world = new SimWorld();
-    check('entities created', world.entities.length === 16, `${world.entities.length} entities`);
-    check('dummies can be left out', new SimWorld(SEED, SOLO).entities.length === 13);
+    check('entities created', world.entities.length === 15, `${world.entities.length} entities`);
+    check('bots can be left out', new SimWorld(SEED, SOLO).entities.length === 13);
     check('player is magnetic', world.player.magnetic);
     check('player mass read back from rapier', Math.abs(world.player.mass - 5) < 0.001,
       `${world.player.mass.toFixed(3)} kg`);
@@ -250,192 +250,226 @@ async function main(): Promise<void> {
     check('and it is the lane ball', target?.spawn.z === -6);
   });
 
-  section('Dummy players — the untested half of the design');
+  section('Bot decisions (pure, no world needed)');
   {
-    const world = new SimWorld();
-    const dummies = world.entities.filter((e) => e.kind === 'dummy');
-    check('three dummies exist', dummies.length === 3, `${dummies.length}`);
-    check('they are player-shaped', dummies.every((d) => Math.abs(d.mass - 5) < 0.001));
-    check('and magnetic', dummies.every((d) => d.magnetic));
+    const { decideBot } = await import('@magnet/shared/sim/Bot');
+    const still = { x: 0, y: 0, z: 0 };
+    const bot = (pos: Vec3, vel = still, dashReady = false) => ({ id: 1, pos, vel, dashReady });
 
-    run(world, TICK_RATE * 2);
-    check('dummies settle without falling off', world.me.knockouts === 0);
-    check('an idle player pulls on nothing',
-      !world.links.some((l) => l.sourceId === world.playerId));
-    // Dummies fire a focused beam, not a cone, or their own reaction forces
-    // launch them off the arena before you can play with them.
-    check('dummy magnets only ever touch the player',
-      world.links.every((l) => l.sourceId === world.playerId || l.targetId === world.playerId));
+    // Self-preservation outranks everything: a bot sailing off the edge must
+    // stop fighting and run for the middle.
+    const falling = decideBot(bot({ x: 8, y: 0.55, z: 0 }, { x: 6, y: 0, z: 0 }, true),
+      [{ id: 2, pos: { x: 9, y: 0.55, z: 0 } }], 1, PLATFORM_RADIUS);
+    check('a bot heading off the edge runs inward', falling.moveX < -0.9,
+      `moveX=${falling.moveX.toFixed(2)}`);
+    check('and grapples back with attract', falling.magnet === -1);
+    check('and spends its dash on the recovery', falling.dash);
+
+    // Position alone is not enough — being flung is the normal way to travel,
+    // so a bot standing safely but moving fast outward must still react.
+    const safeButDoomed = decideBot(bot({ x: 3, y: 0.55, z: 0 }, { x: 30, y: 0, z: 0 }),
+      [{ id: 2, pos: { x: 0, y: 0.55, z: 0 } }], 1, PLATFORM_RADIUS);
+    check('danger is judged on projected position', safeButDoomed.moveX < 0,
+      `moveX=${safeButDoomed.moveX.toFixed(2)}`);
+
+    // Caution is the difference between an opponent and a wall: at 1 a bot
+    // bails so early it is effectively unkillable, which is what made the first
+    // build's bots survive every single balance run.
+    // Tested via the emergency grapple, not movement: with no targets a bot
+    // drifts back to the middle anyway, so `moveX` cannot tell panic from idle.
+    const edgy = { x: 6.4, y: 0.55, z: 0 };
+    let paranoid = 0;
+    let reckless = 0;
+    withTunables({ botCaution: 1.2 }, () => {
+      paranoid = decideBot(bot(edgy, { x: 4, y: 0, z: 0 }), [], 1, PLATFORM_RADIUS).magnet;
+    });
+    withTunables({ botCaution: 0.2 }, () => {
+      reckless = decideBot(bot(edgy, { x: 4, y: 0, z: 0 }), [], 1, PLATFORM_RADIUS).magnet;
+    });
+    check('high caution panics and grapples home', paranoid === -1);
+    check('low caution keeps committing', reckless === 0);
+
+    // Target outward of the bot -> shove. Target inward -> reposition first.
+    const lined = decideBot(bot({ x: 2, y: 0.55, z: 0 }),
+      [{ id: 2, pos: { x: 5, y: 0.55, z: 0 } }], 1, PLATFORM_RADIUS);
+    check('a lined-up bot shoves outward', lined.magnet > 0, `magnet=${lined.magnet}`);
+    check('and holds still while shoving', lined.moveX === 0 && lined.moveZ === 0);
+
+    const wrongSide = decideBot(bot({ x: 6, y: 0.55, z: 0 }),
+      [{ id: 2, pos: { x: 2, y: 0.55, z: 0 } }], 1, PLATFORM_RADIUS);
+    check('a badly placed bot repositions instead', wrongSide.magnet <= 0,
+      `magnet=${wrongSide.magnet}`);
+    check('moving toward the inside of its target', wrongSide.moveX < 0,
+      `moveX=${wrongSide.moveX.toFixed(2)}`);
+
+    const alone = decideBot(bot({ x: 7, y: 0.55, z: 0 }), [], 1, PLATFORM_RADIUS);
+    check('with nobody left it returns to the middle', alone.moveX < 0 && alone.magnet === 0);
+
+    // Two bots at identical positions must not act in lockstep.
+    const a1 = decideBot({ id: 1, pos: { x: 2, y: 0.55, z: 0 }, vel: still, dashReady: false },
+      [{ id: 9, pos: { x: 5, y: 0.55, z: 0 } }], 40, PLATFORM_RADIUS);
+    const a2 = decideBot({ id: 2, pos: { x: 2, y: 0.55, z: 0 }, vel: still, dashReady: false },
+      [{ id: 9, pos: { x: 5, y: 0.55, z: 0 } }], 40, PLATFORM_RADIUS);
+    check('aim wobble is desynchronised per bot', a1.aimX !== a2.aimX || a1.aimZ !== a2.aimZ);
+    check('but stays deterministic for a given bot and tick',
+      decideBot({ id: 1, pos: { x: 2, y: 0.55, z: 0 }, vel: still, dashReady: false },
+        [{ id: 9, pos: { x: 5, y: 0.55, z: 0 } }], 40, PLATFORM_RADIUS).aimZ === a1.aimZ);
   }
 
-  section('Flinging another player (inert dummy)');
-  withTunables({ coneHalfAngleDeg: 25 }, () => {
-    const world = new SimWorld();
-    run(world, TICK_RATE);
-    const inert = world.entities.find((e) => e.kind === 'dummy' && e.spawn.x === -5)!;
-    const start = { ...inert.pos };
+  section('Bots in a live world');
+  {
+    const { BotDirector } = await import('@magnet/shared/sim/Bot');
+    const director = new BotDirector();
+    const world = new SimWorld(SEED, { players: 1, bots: 3, match: false });
+    check('bots are players, not a separate entity kind',
+      world.entities.filter((e) => e.kind === 'player').length === 4);
+    check('the default world ships a beatable number of them',
+      new SimWorld(SEED).players.size === 3);
+    check('and are flagged as bots',
+      [...world.players.values()].filter((p) => p.isBot).length === 3);
+    check('each spawn slot gets its own colour',
+      new Set([...world.players.values()].map((p) => p.entity.tint)).size === 4);
 
-    // Aim at it and shove.
-    const dx = inert.pos.x - world.player.pos.x;
-    const dz = inert.pos.z - world.player.pos.z;
-    const len = Math.hypot(dx, dz);
-    run(world, 40, (i) => {
-      i.magnet = 1;
-      i.aimX = dx / len;
-      i.aimZ = dz / len;
-    });
-
-    const moved = Math.hypot(inert.pos.x - start.x, inert.pos.z - start.z);
-    check('a player-mass body can be shoved', moved > 1, `${moved.toFixed(2)}m`);
-    check('and it never fights back', !world.links.some((l) => l.sourceId === inert.id));
-
-    // Equal masses, so the reaction should push you back about as far.
-    const recoil = Math.hypot(world.player.pos.x, world.player.pos.z);
-    check('equal mass means real recoil', recoil > 0.5, `${recoil.toFixed(2)}m`);
-  });
-
-  section('Tug-of-war (opposer dummy)');
-  withTunables({ coneHalfAngleDeg: 25 }, () => {
-    /** Attract the opposer for 45 ticks; report how far it was dragged. */
-    const pull = (fightBack: boolean): { dragged: number; world: SimWorld; id: EntityId } => {
-      const world = new SimWorld();
-      const opposer = world.entities.find((e) => e.kind === 'dummy' && e.spawn.x === -3)!;
-      if (!fightBack) world.setDummyBehavior(opposer.id, 'inert');
-
-      run(world, TICK_RATE);
-      const start = { ...opposer.pos };
-      const dx = opposer.pos.x - world.player.pos.x;
-      const dz = opposer.pos.z - world.player.pos.z;
-      const len = Math.hypot(dx, dz);
-      run(world, 45, (i) => {
-        i.magnet = -1;
-        i.aimX = dx / len;
-        i.aimZ = dz / len;
-      });
-
-      return {
-        dragged: Math.hypot(opposer.pos.x - start.x, opposer.pos.z - start.z),
-        world,
-        id: opposer.id,
-      };
+    const inputs = new Map<EntityId, Input>();
+    const step = (n: number): void => {
+      for (let i = 0; i < n; i++) {
+        inputs.clear();
+        inputs.set(world.playerId, emptyInput(world.tick + 1));
+        director.drive(world, inputs);
+        world.step(inputs);
+      }
     };
 
-    // Identical input against the same body, the only difference being whether
-    // it fights back. A control run is the only honest way to measure this:
-    // the player's own cone also grabs other bodies, so "nobody moved" was
-    // never going to hold.
-    const passive = pull(false);
-    const fighting = pull(true);
+    step(TICK_RATE * 8);
 
-    const mine = fighting.world.links.find(
-      (l) => l.sourceId === fighting.world.playerId && l.targetId === fighting.id,
-    );
-    const theirs = fighting.world.links.find(
-      (l) => l.sourceId === fighting.id && l.targetId === fighting.world.playerId,
-    );
-    check('both magnets engage each other', !!mine && !!theirs);
-    // This exact cancellation is the whole mechanism.
-    check('forces are equal and opposite',
-      !!mine && !!theirs && Math.abs(mine.force + theirs.force) < 1e-9,
-      `${mine?.force.toFixed(1)}N vs ${theirs?.force.toFixed(1)}N`);
-    check('fighting back genuinely resists the pull',
-      fighting.dragged < passive.dragged * 0.4,
-      `dragged ${fighting.dragged.toFixed(2)}m vs ${passive.dragged.toFixed(2)}m passive`);
-  });
+    // The single most important property: bots must not kill themselves. Their
+    // own recoil is what does it, so this is a real risk, not a formality.
+    const botDeaths = [...world.players.values()]
+      .filter((p) => p.isBot)
+      .reduce((sum, p) => sum + p.deaths, 0);
+    check('bots survive 8 seconds unattended', botDeaths === 0, `${botDeaths} falls`);
+    // Bots only: the human is being actively knocked off, so a respawning
+    // human sitting at spawn height is a pass, not a failure.
+    check('and stay on the platform',
+      [...world.players.values()].filter((p) => p.isBot)
+        .every((p) => Math.abs(p.entity.pos.y - 0.55) < 0.2));
 
-  section('Getting grabbed (grabber dummy)');
-  {
-    const world = new SimWorld();
-    const grabber = world.entities.find((e) => e.kind === 'dummy' && e.spawn.x === 5)!;
-    const gap = (): number =>
-      Math.hypot(grabber.pos.x - world.player.pos.x, grabber.pos.z - world.player.pos.z);
-    const gap0 = gap();
+    // They also have to actually play, not just mill about safely.
+    let engaged = 0;
+    for (let i = 0; i < TICK_RATE * 6; i++) {
+      inputs.clear();
+      inputs.set(world.playerId, emptyInput(world.tick + 1));
+      director.drive(world, inputs);
+      world.step(inputs);
+      if (world.links.some((l) => world.players.get(l.sourceId)?.isBot)) engaged++;
+    }
+    check('bots use their magnets on someone', engaged > 30, `${engaged} ticks with a bot tether`);
 
-    // The player does nothing at all. The dummy should still close on them.
-    run(world, TICK_RATE * 3);
-    const gap1 = gap();
-
-    check('a grabber reels you in unprompted', gap1 < gap0 - 1,
-      `${gap0.toFixed(2)}m -> ${gap1.toFixed(2)}m`);
-    check('and it lets go once it is close',
-      !world.links.some((l) => l.sourceId === grabber.id));
-
-    // Arriving at contact is fine; being unable to leave is not. A constant
-    // pull would pin you there permanently.
-    let escaped = 0;
-    run(world, TICK_RATE * 2, (i) => {
-      i.moveX = -1;
-      escaped = Math.max(escaped, gap());
-    });
-    check('you can walk out of a grab', escaped > 3, `opened up to ${escaped.toFixed(2)}m`);
-
-    let everLinked = false;
-    const w2 = new SimWorld();
-    const far = w2.entities.find((e) => e.kind === 'dummy' && e.spawn.x === 5)!;
-    run(w2, 30, () => {
-      if (w2.links.some((l) => l.sourceId === far.id)) everLinked = true;
-    });
-    check('the tether is visible to the renderer while pulling', everLinked);
+    const idle = world.players.get(world.playerId)!;
+    check('and they come after the human', idle.deaths > 0 || engaged > 100,
+      `human falls=${idle.deaths}, engaged=${engaged}`);
   }
 
-  section('Multiple players in one world');
+  section('Rounds, elimination and the shrinking arena');
   {
-    const world = new SimWorld(SEED, { dummies: false, players: 0 });
-    check('a room can start empty', world.players.size === 0);
+    const world = new SimWorld(SEED, { players: 3, bots: 0 });
+    const [a, b] = [...world.players.values()];
+    const step = (n: number): void => {
+      for (let i = 0; i < n; i++) world.step(new Map<EntityId, Input>());
+    };
 
-    const a = world.addPlayer();
-    const b = world.addPlayer();
-    check('players get distinct ids', a.id !== b.id, `${a.id} vs ${b.id}`);
-    check('and separate spawn points',
-      Math.hypot(a.entity.spawn.x - b.entity.spawn.x, a.entity.spawn.z - b.entity.spawn.z) > 1);
+    check('a match opens on a countdown', world.match.phase === 'countdown',
+      world.match.phase);
+    check('and the arena starts full size', world.arenaRadius === PLATFORM_RADIUS);
 
-    run(world, TICK_RATE);
-    check('both settle on the platform',
-      Math.abs(a.entity.pos.y - 0.55) < 0.05 && Math.abs(b.entity.pos.y - 0.55) < 0.05);
+    // Nobody may act before the bell.
+    const before = { ...a!.entity.pos };
+    for (let i = 0; i < 30; i++) {
+      const shove = new Map<EntityId, Input>();
+      shove.set(b!.id, { ...emptyInput(world.tick + 1), moveX: 1, moveZ: 1 });
+      world.step(shove);
+    }
+    check('input is frozen during the countdown',
+      Math.hypot(a!.entity.pos.x - before.x, a!.entity.pos.z - before.z) < 0.01);
 
-    // Per-player scores and cooldowns must not be shared state.
-    const inputs = new Map<EntityId, Input>();
-    inputs.set(a.id, { ...emptyInput(world.tick), dash: true });
-    inputs.set(b.id, emptyInput(world.tick));
-    world.step(inputs);
-    check('dash cooldown is per player', a.dashCooldown > 0 && b.dashCooldown === 0,
-      `a=${a.dashCooldown} b=${b.dashCooldown}`);
+    step(TICK_RATE * 3);
+    check('then the round starts', world.match.phase === 'playing', world.match.phase);
 
-    // One player shoves the other: the core PvP interaction, now between two
-    // real players rather than a player and a scripted dummy.
-    withTunables({ coneHalfAngleDeg: 25 }, () => {
-      const start = { ...b.entity.pos };
-      const dx = b.entity.pos.x - a.entity.pos.x;
-      const dz = b.entity.pos.z - a.entity.pos.z;
-      const len = Math.hypot(dx, dz);
+    // Elimination: falling ends your round rather than costing five seconds.
+    withTunables({ killY: 5 }, () => step(1));
+    check('a fall eliminates rather than respawns', world.alivePlayers.length === 0,
+      `${world.alivePlayers.length} alive`);
+    check('and is counted once, not every tick', a!.deaths === 1, `deaths=${a!.deaths}`);
+    step(10);
+    check('still counted once after several ticks', a!.deaths === 1, `deaths=${a!.deaths}`);
+    check('the round ends when nobody is left', world.match.phase === 'roundOver',
+      world.match.phase);
 
-      // Sampled during the push, not after: aim is fixed at the starting
-      // direction, so by the last tick the target has drifted out of the cone.
-      let everLinked = false;
-      for (let n = 0; n < 40; n++) {
-        const shove = new Map<EntityId, Input>();
-        shove.set(a.id, { ...emptyInput(world.tick + 1), aimX: dx / len, aimZ: dz / len, magnet: 1 });
-        shove.set(b.id, emptyInput(world.tick + 1));
-        world.step(shove);
-        if (world.links.some((l) => l.sourceId === a.id && l.targetId === b.id)) everLinked = true;
+    // Next round resets everyone.
+    step(TICK_RATE * 4);
+    check('the next round revives everybody', world.alivePlayers.length === 3);
+    check('and counts up', world.match.round === 2, `round ${world.match.round}`);
+    check('with the arena reset to full', world.arenaRadius === PLATFORM_RADIUS);
+  }
+
+  section('Shrinking closes the arena down');
+  {
+    const world = new SimWorld(SEED, { players: 2, bots: 0 });
+    const step = (n: number): void => {
+      for (let i = 0; i < n; i++) world.step(new Map<EntityId, Input>());
+    };
+
+    withTunables({ shrinkGraceSeconds: 1, shrinkSeconds: 4, arenaMinRadius: 3 }, () => {
+      step(TICK_RATE * 3);
+      check('nothing shrinks during the grace period',
+        world.arenaRadius > PLATFORM_RADIUS - 1.5, `${world.arenaRadius.toFixed(2)}m`);
+
+      // Sampled while it closes, not after: the shrink strands a player, which
+      // ends the round and resets the whole arena before a final read.
+      const outer = world.entities.find((e) => e.kind === 'ball' && e.spawn.x === 6.5)!;
+      let smallest = world.arenaRadius;
+      let ballFell = false;
+      let anyoneStranded = false;
+      for (let i = 0; i < TICK_RATE * 6; i++) {
+        step(1);
+        smallest = Math.min(smallest, world.arenaRadius);
+        if (outer.pos.y < -3) ballFell = true;
+        if (world.alivePlayers.length < 2) anyoneStranded = true;
       }
 
-      const moved = Math.hypot(b.entity.pos.x - start.x, b.entity.pos.z - start.z);
-      check('one player can shove another', moved > 1, `${moved.toFixed(2)}m`);
-      check('the shove is visible as a link', everLinked);
+      check('then it closes to the floor', Math.abs(smallest - 3) < 0.01, `${smallest.toFixed(2)}m`);
+      // The collider has to move, not just the number the HUD reads, or players
+      // stand on invisible floor well beyond the visible edge.
+      check('the collider really shrank, not just the number', ballFell,
+        'a ball resting at r=6.7 fell into the void');
+      check('and it strands players, which is the point', anyoneStranded);
     });
+  }
 
-    // A player who never sends input must not freeze the tick or inherit stale
-    // intent — the server relies on this when a client drops out.
-    const soloTick = world.tick;
-    world.step(new Map());
-    check('a tick with no inputs at all still advances', world.tick === soloTick + 1);
+  section('Winning a match');
+  {
+    const world = new SimWorld(SEED, { players: 2, bots: 0 });
+    const [a, b] = [...world.players.values()];
+    const step = (n: number): void => {
+      for (let i = 0; i < n; i++) world.step(new Map<EntityId, Input>());
+    };
 
-    world.removePlayer(b.id);
-    check('leaving removes the player', world.players.size === 1);
-    check('and its body', !world.entities.some((e) => e.id === b.id));
-    run(world, 10);
-    check('the survivor keeps simulating', Math.abs(a.entity.pos.y - 0.55) < 0.6);
+    // Rounds decided by timeout rather than by knockout, because a test cannot
+    // teleport a body: `readBack` overwrites any hand-placed position from the
+    // rigid body every single tick. On a timeout the player nearest the middle
+    // takes the round, and `a` spawns dead centre.
+    withTunables({ roundsToWin: 2, roundSeconds: 1 }, () => {
+      for (let i = 0; i < TICK_RATE * 30 && world.match.champion === 0; i++) step(1);
+
+      check('round wins accumulate', a!.roundWins >= 2, `${a!.roundWins} wins`);
+      check('the centre player takes a timeout', b!.roundWins === 0, `${b!.roundWins} wins`);
+      check('and the match is awarded', world.match.champion === a!.id,
+        `champion=${world.match.champion}`);
+
+      step(TICK_RATE * 7);
+      check('then a fresh match begins', world.match.champion === 0 && world.match.round === 1);
+      check('with the scoreboard cleared', a!.roundWins === 0 && b!.roundWins === 0);
+    });
   }
 
   section('Ring-out and respawn');
